@@ -110,7 +110,8 @@ static int atan_lut_coef = 8;
 
 static int verbosity = 0;
 static int printLevels = 0;
-static int printLevelNo = 1;
+static int printLevelsNo = 1;
+static int printLevelsMs = 1000; //in milliseconds
 static FILE *printLevelFile = NULL;
 static int levelMax = 0;
 static int levelMaxMax = 0;
@@ -1243,11 +1244,10 @@ void *runPrintLevels(void *ctx) {
     struct timespec spec;
 	//pthread_rwlock_init(&s->rw, NULL);
 
-    fprintf(stderr, "%s", "Starting print levels thread loop");
     while (!do_exit) {
-        sleep(printLevelNo);
+        usleep(printLevelsMs);
         clock_gettime(CLOCK_REALTIME, &spec);
-        spec.tv_sec += 5;
+        spec.tv_sec++;
         if (0 == pthread_cond_timedwait(&s->cond, &s->mutex, &spec)) {
             fprintf(printLevelFile, 
                 "%.3f kHz, %.1f avg rms, %d max rms, %d max max rms, %d squelch rms, %d rms, %.1f dB rms level, %.2f dB avg rms level\n", 
@@ -1262,6 +1262,7 @@ void *runPrintLevels(void *ctx) {
             fflush(printLevelFile);
             levelMax = 0;
             levelSum = 0;
+            printLevelsNo = 1;
         }
         pthread_mutex_unlock(&mutex);    
     }
@@ -1326,7 +1327,7 @@ void full_demod(struct demod_state *d)
                 levelMaxMax = info->sr;
             }
 
-            info->avgRms = levelSum / printLevels;
+            info->avgRms = levelSum / printLevelsNo++;
             info->rmsLevel = 20.0 * log10( 1E-10 + info->sr );
             info->avgRmsLevel = 20.0 * log10( 1E-10 + info->avgRms );
             info->freqK = dongle.userFreq / 1000.0;
@@ -1935,7 +1936,8 @@ int main(int argc, char **argv)
 			demod.squelch_level = (int)atof(optarg);
 			break;
 		case 'L':
-			printLevels = (int)atof(optarg);
+            printLevels = (int)atof(optarg);
+			printLevelsMs *= printLevels;
             break;
         case 'P':
             printLevelFile = fopen(optarg, "wb");
@@ -2219,7 +2221,6 @@ int main(int argc, char **argv)
 	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
     if (printLevels) {
-        fprintf(stderr, "%s", "Creating print levels thread");
         pthread_create(&demod.info->pid, NULL, runPrintLevels, demod.info);
 	}
 
