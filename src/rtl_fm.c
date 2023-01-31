@@ -111,6 +111,7 @@ static int atan_lut_coef = 8;
 static int verbosity = 0;
 static int printLevels = 0;
 static int printLevelNo = 1;
+static FILE *printLevelFile = NULL;
 static int levelMax = 0;
 static int levelMaxMax = 0;
 static double levelSum = 0.0;
@@ -960,8 +961,8 @@ int esbensen(int ar, int aj, int br, int bj)
 {
 	int cj, dr, dj;
 	int scaled_pi = 2608; /* 1<<14 / (2*pi) */
-	dr = (br - ar) * 2;
-	dj = (bj - aj) * 2;
+	dr = (br - ar) << 1;
+	dj = (bj - aj) << 1;
 	cj = bj*dr - br*dj; /* imag(ds*conj(s)) */
 	return (scaled_pi * cj / (ar*ar+aj*aj+1));
 }
@@ -1127,13 +1128,14 @@ int rms(int16_t *samples, int len, int step, int omitDCfix)
 /* largely lifted from rtl_power */
 {
 	double dc, err;
-	int i, num;
+	double tstep;
+    int i, num;
 	int32_t t, s;
 	uint32_t p;  /* use sign bit to prevent overflow */
 
 	p = 0;
 	t = 0L;
-	while (len > step * 32768) /* 8 bit squared = 16 bit. limit to 2^16 for 32 bit squared sum */
+	while (len > (step << 15)) /* 8 bit squared = 16 bit. limit to 2^16 for 32 bit squared sum */
 		++step;  /* increase step to prevent overflow */
 	for (i=0; i<len; i+=step) {
 		s = (long)samples[i];
@@ -1148,8 +1150,9 @@ int rms(int16_t *samples, int len, int step, int omitDCfix)
 	}
 
 	/* correct for dc offset in squares */
-	dc = (double)(t*step) / (double)len;
-	err = t * 2 * dc - dc * dc * len;
+    tstep = (double)(t*step);
+	dc = tstep / (double)len;
+	err = dc * ((t << 1) - tstep);
 
 	return (int)sqrt((p-err) / len);
 }
@@ -1219,14 +1222,63 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
+typedef struct {
+
+    double freqK;
+    double avgRms;
+    double rmsLevel; 
+    double avgRmsLevel; 
+    int squelchLevel;
+    int sr;
+	pthread_t pid;
+	pthread_cond_t cond;
+    pthread_mutex_t mutex;
+} printLevelsInfo;
+
+printLevelsInfo info; //TODO move this to local and pass it
+void *runPrintLevels(void *ctx) {
+    printLevelsInfo *s = (printLevelsInfo *) ctx;
+	pthread_cond_t cond  = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    struct timespec spec;
+	//pthread_rwlock_init(&s->rw, NULL);
+
+    while (!do_exit) {
+        sleep(printLevelNo);
+        clock_gettime(CLOCK_REALTIME, &spec);
+        spec.tv_sec += 5;
+        if (0 == pthread_cond_timedwait(&s->cond, &s->mutex, &spec)) {
+            fprintf(printLevelFile, 
+                "%.3f kHz, %.1f avg rms, %d max rms, %d max max rms, %d squelch rms, %d rms, %.1f dB rms level, %.2f dB avg rms level\n", 
+                s->freqK,
+                s->avgRms, 
+                levelMax, 
+                levelMaxMax, 
+                s->squelchLevel,
+                s->sr,
+                s->rmsLevel,
+                s->avgRmsLevel);
+            fflush(printLevelFile);
+            levelMax = 0;
+            levelSum = 0;
+        }
+        pthread_mutex_unlock(&mutex);    
+    }
+
+    pthread_mutex_unlock(&mutex);
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&cond);
+
+    return NULL;
+}
+
 void full_demod(struct demod_state *d)
 {
 	struct cmd_state *c = d->cmd;
-	double freqK, avgRms, rmsLevel, avgRmsLevel;
 	int i, ds_p;
-	int sr = 0;
 	static int printBlockLen = 1;
 	ds_p = d->downsample_passes;
+
 	if (ds_p) {
 		for (i=0; i < ds_p; i++) {
 			fifth_order(d->lowpassed,   (d->lp_len >> i), d->lp_i_hist[i]);
@@ -1245,9 +1297,9 @@ void full_demod(struct demod_state *d)
 	}
 	/* power squelch */
 	if (d->squelch_level) {
-		sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
-		if (sr >= 0) {
-			if (sr < d->squelch_level) {
+		info.sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+		if (info.sr >= 0) {
+			if (info.sr < d->squelch_level) {
 				d->squelch_hits++;
 				for (i=0; i<d->lp_len; i++) {
 					d->lowpassed[i] = 0;
@@ -1258,30 +1310,29 @@ void full_demod(struct demod_state *d)
 	}
 
 	if (printLevels) {
-		if (!sr)
-			sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
-		--printLevelNo;
-		if (printLevels && sr >= 0) {
-			levelSum += sr;
-			if (levelMax < sr)		levelMax = sr;
-			if (levelMaxMax < sr)	levelMaxMax = sr;
-			if  (!printLevelNo) {
-				printLevelNo = printLevels;
-				freqK = dongle.userFreq /1000.0;
-				avgRms = levelSum / printLevels;
-				rmsLevel = 20.0 * log10( 1E-10 + sr );
-				avgRmsLevel = 20.0 * log10( 1E-10 + avgRms );
-				fprintf(stderr, "%.3f kHz, %.1f avg rms, %d max rms, %d max max rms, %d squelch rms, %d rms, %.1f dB rms level, %.2f dB avg rms level\n",
-					freqK, avgRms, levelMax, levelMaxMax, d->squelch_level, sr, rmsLevel, avgRmsLevel );
-				levelMax = 0;
-				levelSum = 0;
-			}
+        pthread_mutex_lock(&info.mutex);
+
+		if (!info.sr)
+			info.sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+		if (info.sr >= 0) {
+			levelSum += info.sr;
+			if (levelMax < info.sr)		levelMax = info.sr;
+			if (levelMaxMax < info.sr)	levelMaxMax = info.sr;
+
+            info.avgRms = levelSum / printLevels;
+            info.rmsLevel = 20.0 * log10( 1E-10 + info.sr );
+            info.avgRmsLevel = 20.0 * log10( 1E-10 + info.avgRms );
+            info.squelchLevel = d->squelch_level;
+            info.freqK = dongle.userFreq / 1000.0;
 		}
+
+        pthread_cond_signal(&info.cond);
+        pthread_mutex_unlock(&info.mutex);
 	}
 
 	if (c->filename) {
-		if (!sr)
-			sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+		if (!info.sr)
+			info.sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
 		if ( printBlockLen && verbosity ) {
 			fprintf(stderr, "block length for rms after decimation is %d samples\n", d->lp_len);
 			if ( d->lp_len < 128 )
@@ -1290,8 +1341,8 @@ void full_demod(struct demod_state *d)
 		}
 		if (!c->numSummed)
 			c->levelSum = 0;
-		if (c->numSummed < c->numMeas && sr >= 0) {
-			c->levelSum += sr;
+		if (c->numSummed < c->numMeas && info.sr >= 0) {
+			c->levelSum += info.sr;
 			c->numSummed++;
 		}
 	}
@@ -1324,6 +1375,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 	uint32_t sampleP, samplePowSum = 0.0;
 	int samplePowCount = 0, step = 2;
 	time_t rawtime;
+    int x;
 
 	if (do_exit) {
 		return;}
@@ -1360,11 +1412,13 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 		s->sampleMax = sampleMax;
 	}
 	if (c->checkADCrms ) {
-		while ( (int)len >= 16384 * step )
+		while ( (int)len >= (step << 14) )
 			step += 2;
 		for (i=0; i<(int)len; i+= step) {
-			sampleP  = ( (int)buf[i]   -127 ) * ( (int)buf[i]   -127 );  /* I^2 */
-			sampleP += ( (int)buf[i+1] -127 ) * ( (int)buf[i+1] -127 );  /* Q^2 */
+            x = (int)buf[i] - 127;
+			sampleP  = x*x;  /* I^2 */
+            x = (int)buf[i+1] - 127;
+			sampleP += x*x;  /* Q^2 */
 			samplePowSum += sampleP;
 			++samplePowCount;
 		}
@@ -1404,6 +1458,8 @@ static void *demod_thread_fn(void *arg)
 	struct demod_state *d = arg;
 	struct output_state *o = d->output_target;
 	struct cmd_state *c = d->cmd;
+
+    pthread_create(&info.pid, NULL, runPrintLevels, &info);
 	while (!do_exit) {
 		safe_cond_wait(&d->ready, &d->ready_m);
 		pthread_rwlock_wrlock(&d->rw);
@@ -1430,9 +1486,10 @@ static void *demod_thread_fn(void *arg)
 
 		if (OutputToStdout) {
 			pthread_rwlock_wrlock(&o->rw);
-			memcpy(o->result, d->result, 2*d->result_len);
+			memcpy(o->result, d->result, d->result_len << 1);
 			o->result_len = d->result_len;
 			pthread_rwlock_unlock(&o->rw);
+			//fflush(o->file);
 			safe_cond_signal(&o->ready, &o->ready_m);
 		}
 	}
@@ -1442,13 +1499,15 @@ static void *demod_thread_fn(void *arg)
 static void *output_thread_fn(void *arg)
 {
 	struct output_state *s = arg;
+
 	if (!waveHdrStarted) {
 		while (!do_exit) {
 			/* use timedwait and pad out under runs */
 			safe_cond_wait(&s->ready, &s->ready_m);
 			pthread_rwlock_rdlock(&s->rw);
 			fwrite(s->result, 2, s->result_len, s->file);
-			pthread_rwlock_unlock(&s->rw);
+			//fflush(s->file);
+            pthread_rwlock_unlock(&s->rw);
 		}
 	} else {
 		while (!do_exit) {
@@ -1457,6 +1516,7 @@ static void *output_thread_fn(void *arg)
 			pthread_rwlock_rdlock(&s->rw);
 			/* distinguish for endianness: wave requires little endian */
 			waveWriteSamples(s->file, s->result, s->result_len, 0);
+			//fflush(s->file);
 			pthread_rwlock_unlock(&s->rw);
 		}
 	}
@@ -1493,7 +1553,7 @@ static void optimal_settings(uint64_t freq, uint32_t rate)
 	capture_freq += cs->edge * dm->rate_in / 2;
 	if (verbosity >= 2)
 		fprintf(stderr, "optimal_settings(freq = %f MHz): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %f MHz\n", freq * 1E-6, cs->edge, dm->rate_in, capture_freq * 1E-6 );
-	dm->output_scale = (1<<15) / (128 * dm->downsample);
+	dm->output_scale = 256 / dm->downsample;
 	if (dm->output_scale < 1) {
 		dm->output_scale = 1;}
 	if (dm->mode_demod == &fm_demod) {
@@ -1828,7 +1888,7 @@ int main(int argc, char **argv)
 	controller_init(&controller);
 	cmd_init(&cmd);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:q:c:w:W:D:nHv")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:P:q:c:w:W:D:nHv")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1866,7 +1926,11 @@ int main(int argc, char **argv)
 			break;
 		case 'L':
 			printLevels = (int)atof(optarg);
-			break;
+            break;
+        case 'P':
+            printLevelFile = fopen(optarg, "wb");
+            setvbuf(printLevelFile, NULL, _IONBF, 0);
+            break;
 		case 's':
 			demod.rate_in = (uint32_t)atofs(optarg);
 			demod.rate_out = (uint32_t)atofs(optarg);
@@ -2007,6 +2071,9 @@ int main(int argc, char **argv)
 		}
 	}
 
+    if (!printLevelFile) {
+        printLevelFile = stderr;
+    }
 	if (verbosity)
 		fprintf(stderr, "verbosity set to %d\n", verbosity);
 
@@ -2151,6 +2218,7 @@ int main(int argc, char **argv)
 	else {
 		fprintf(stderr, "\nLibrary error %d, exiting...\n", r);}
 
+    fclose(printLevelFile);
 	rtlsdr_cancel_async(dongle.dev);
 	pthread_join(dongle.thread, NULL);
 	safe_cond_signal(&demod.ready, &demod.ready_m);
