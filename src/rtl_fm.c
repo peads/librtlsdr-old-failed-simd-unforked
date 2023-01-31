@@ -124,7 +124,6 @@ char * aCritStr[] = { "in", "out", "<", ">" };
 time_t stop_time;
 int duration = 0;
 
-
 struct cmd_state
 {
 	const char * filename;
@@ -154,6 +153,19 @@ struct cmd_state
 	double statSumLevels[FREQUENCIES_LIMIT];
 	float statMinLevel[FREQUENCIES_LIMIT];
 	float statMaxLevel[FREQUENCIES_LIMIT];
+};
+
+struct printLevelsInfo {
+
+    double freqK;
+    double avgRms;
+    double rmsLevel; 
+    double avgRmsLevel; 
+    int squelchLevel;
+    int sr;
+	pthread_t pid;
+	pthread_cond_t cond;
+    pthread_mutex_t mutex;
 };
 
 struct dongle_state
@@ -216,6 +228,7 @@ struct demod_state
 	pthread_mutex_t ready_m;
 	struct output_state *output_target;
 	struct cmd_state *cmd;
+    struct printLevelsInfo *info;
 };
 
 struct output_state
@@ -1222,27 +1235,15 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 	}
 }
 
-typedef struct {
-
-    double freqK;
-    double avgRms;
-    double rmsLevel; 
-    double avgRmsLevel; 
-    int squelchLevel;
-    int sr;
-	pthread_t pid;
-	pthread_cond_t cond;
-    pthread_mutex_t mutex;
-} printLevelsInfo;
-
-printLevelsInfo info; //TODO move this to local and pass it
 void *runPrintLevels(void *ctx) {
-    printLevelsInfo *s = (printLevelsInfo *) ctx;
-	pthread_cond_t cond  = PTHREAD_COND_INITIALIZER;
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    struct printLevelsInfo *s = (struct printLevelsInfo *) ctx;
+	pthread_cond_t cond  = s->cond;
+    pthread_mutex_t mutex = s->mutex;
+
     struct timespec spec;
 	//pthread_rwlock_init(&s->rw, NULL);
 
+    fprintf(stderr, "%s", "Starting print levels thread loop");
     while (!do_exit) {
         sleep(printLevelNo);
         clock_gettime(CLOCK_REALTIME, &spec);
@@ -1277,7 +1278,9 @@ void full_demod(struct demod_state *d)
 	struct cmd_state *c = d->cmd;
 	int i, ds_p;
 	static int printBlockLen = 1;
+    struct printLevelsInfo *info = d->info;
 	ds_p = d->downsample_passes;
+    info->squelchLevel = d->squelch_level;
 
 	if (ds_p) {
 		for (i=0; i < ds_p; i++) {
@@ -1297,9 +1300,9 @@ void full_demod(struct demod_state *d)
 	}
 	/* power squelch */
 	if (d->squelch_level) {
-		info.sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
-		if (info.sr >= 0) {
-			if (info.sr < d->squelch_level) {
+		info->sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+		if (info->sr >= 0) {
+			if (info->sr < d->squelch_level) {
 				d->squelch_hits++;
 				for (i=0; i<d->lp_len; i++) {
 					d->lowpassed[i] = 0;
@@ -1310,29 +1313,32 @@ void full_demod(struct demod_state *d)
 	}
 
 	if (printLevels) {
-        pthread_mutex_lock(&info.mutex);
+        pthread_mutex_lock(&info->mutex);
 
-		if (!info.sr)
-			info.sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
-		if (info.sr >= 0) {
-			levelSum += info.sr;
-			if (levelMax < info.sr)		levelMax = info.sr;
-			if (levelMaxMax < info.sr)	levelMaxMax = info.sr;
+		if (!info->sr)
+			info->sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+		if (info->sr >= 0) {
+			levelSum += info->sr;
+			if (levelMax < info->sr) {
+                levelMax = info->sr;
+            }
+			if (levelMaxMax < info->sr)	{
+                levelMaxMax = info->sr;
+            }
 
-            info.avgRms = levelSum / printLevels;
-            info.rmsLevel = 20.0 * log10( 1E-10 + info.sr );
-            info.avgRmsLevel = 20.0 * log10( 1E-10 + info.avgRms );
-            info.squelchLevel = d->squelch_level;
-            info.freqK = dongle.userFreq / 1000.0;
+            info->avgRms = levelSum / printLevels;
+            info->rmsLevel = 20.0 * log10( 1E-10 + info->sr );
+            info->avgRmsLevel = 20.0 * log10( 1E-10 + info->avgRms );
+            info->freqK = dongle.userFreq / 1000.0;
 		}
 
-        pthread_cond_signal(&info.cond);
-        pthread_mutex_unlock(&info.mutex);
+        pthread_cond_signal(&info->cond);
+        pthread_mutex_unlock(&info->mutex);
 	}
 
 	if (c->filename) {
-		if (!info.sr)
-			info.sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+		if (!info->sr)
+			info->sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
 		if ( printBlockLen && verbosity ) {
 			fprintf(stderr, "block length for rms after decimation is %d samples\n", d->lp_len);
 			if ( d->lp_len < 128 )
@@ -1341,8 +1347,8 @@ void full_demod(struct demod_state *d)
 		}
 		if (!c->numSummed)
 			c->levelSum = 0;
-		if (c->numSummed < c->numMeas && info.sr >= 0) {
-			c->levelSum += info.sr;
+		if (c->numSummed < c->numMeas && info->sr >= 0) {
+			c->levelSum += info->sr;
 			c->numSummed++;
 		}
 	}
@@ -1459,8 +1465,7 @@ static void *demod_thread_fn(void *arg)
 	struct output_state *o = d->output_target;
 	struct cmd_state *c = d->cmd;
 
-    pthread_create(&info.pid, NULL, runPrintLevels, &info);
-	while (!do_exit) {
+    while (!do_exit) {
 		safe_cond_wait(&d->ready, &d->ready_m);
 		pthread_rwlock_wrlock(&d->rw);
 		full_demod(d);
@@ -1777,6 +1782,8 @@ void dongle_init(struct dongle_state *s)
 
 void demod_init(struct demod_state *s)
 {
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 	s->rate_in = DEFAULT_SAMPLE_RATE;
 	s->rate_out = DEFAULT_SAMPLE_RATE;
 	s->squelch_level = 0;
@@ -1807,6 +1814,9 @@ void demod_init(struct demod_state *s)
 	pthread_mutex_init(&s->ready_m, NULL);
 	s->output_target = &output;
 	s->cmd = &cmd;
+    s->info = malloc(sizeof(*s->info));
+    s->info->cond = cond;
+    s->info->mutex = mutex;
 }
 
 void demod_cleanup(struct demod_state *s)
@@ -2208,6 +2218,10 @@ int main(int argc, char **argv)
 	pthread_create(&output.thread, NULL, output_thread_fn, (void *)(&output));
 	pthread_create(&demod.thread, NULL, demod_thread_fn, (void *)(&demod));
 	pthread_create(&dongle.thread, NULL, dongle_thread_fn, (void *)(&dongle));
+    if (printLevels) {
+        fprintf(stderr, "%s", "Creating print levels thread");
+        pthread_create(&demod.info->pid, NULL, runPrintLevels, demod.info);
+	}
 
 	while (!do_exit) {
 		usleep(100000);
