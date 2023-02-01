@@ -823,7 +823,7 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
         d = f;
         e = data[i-2];
         f = data[i];
-        data[i/2] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
+        data[i >> 1] = (a + (b+e)*5 + (c+d)*10 + f) >> 4;
     }
     /* archive */
     hist[0] = a;
@@ -890,7 +890,7 @@ int fast_atan2(int y, int x)
         yabs = -yabs;
     }
     if (x >= 0) {
-        angle = pi4  - pi4 * (x-yabs) / (x+yabs);
+        angle = pi4 * (1 - (x-yabs) / (x+yabs)); //pi4  - pi4 * (x-yabs) / (x+yabs);
     } else {
         angle = pi34 - pi4 * (x+yabs) / (yabs-x);
     }
@@ -1456,7 +1456,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
         rotate16_neg90(s->buf16, (int)len);
     }
     pthread_rwlock_wrlock(&d->rw);
-    memcpy(d->lowpassed, s->buf16, 2*len);
+    memcpy(d->lowpassed, s->buf16, (len << 1));
     d->lp_len = len;
     pthread_rwlock_unlock(&d->rw);
     safe_cond_signal(&d->ready, &d->ready_m);
@@ -1621,7 +1621,7 @@ static void *controller_thread_fn(void *arg)
     fprintf(stderr, "Oversampling input by: %ix.\n", demod.downsample);
     fprintf(stderr, "Oversampling output by: %ix.\n", demod.post_downsample);
     fprintf(stderr, "Buffer size: %0.2fms\n",
-            1000 * 0.5 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
+            500.0 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
 
     /* Set the sample rate */
     if (verbosity)
@@ -1675,7 +1675,7 @@ static void *controller_thread_fn(void *arg)
             }
             dongle.mute = DEFAULT_BUFFER_DUMP;
         } else {
-            dongle.mute = 2 * dongle.rate; /* over a second - until parametrized the dongle */
+            dongle.mute = dongle.rate << 1; /* over a second - until parametrized the dongle */
             c->numSummed = 0;
 
             toNextCmdLine(c);
