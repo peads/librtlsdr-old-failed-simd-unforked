@@ -1231,7 +1231,7 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
     }
 }
 
-void *runPrintLevels(void *ctx) {
+static void *runPrintLevels(void *ctx) {
     struct printLevelsInfo *s = (struct printLevelsInfo *) ctx;
     double avgRms;
     double rmsLevel;
@@ -1242,7 +1242,7 @@ void *runPrintLevels(void *ctx) {
         usleep(printLevelsMs);
         pthread_mutex_lock(&s->mutex);
 
-        if (printLevelsFrames > 9 && 0 == pthread_cond_wait(&s->cond, &s->mutex)) {
+        if (printLevelsFrames > printLevels && 0 == pthread_cond_wait(&s->cond, &s->mutex)) {
             avgRms = (double) levelSum / printLevelsFrames;
             rmsLevel = 20.0 * log10( 1E-10 + s->sr );
             avgRmsLevel = 20.0 * log10( 1E-10 + avgRms );
@@ -1261,16 +1261,12 @@ void *runPrintLevels(void *ctx) {
                     avgRmsLevel);
             ret = fputs(output, printLevelFile);
             if (ferror(printLevelFile)) {
-                fprintf(stderr, "I/O error when reading");
+                perror("I/O error when writing");
                 do_exit = 1;
                 continue;
             } else if (feof(printLevelFile)) {
-                fprintf(stderr, "End of file reached successfully");
                 continue;
             }
-            //fflush(stdout);
-            //fflush(stderr);
-            //fflush(printLevelFile);
             levelMax = 0;
             levelSum = 0;
             printLevelsFrames = 1;
@@ -1508,10 +1504,11 @@ static void *demod_thread_fn(void *arg)
             memcpy(o->result, d->result, d->result_len << 1);
             o->result_len = d->result_len;
             pthread_rwlock_unlock(&o->rw);
-            //fflush(o->file);
             safe_cond_signal(&o->ready, &o->ready_m);
         }
     }
+
+    pthread_mutex_unlock(&demod.info->mutex);
     return 0;
 }
 
@@ -1525,7 +1522,6 @@ static void *output_thread_fn(void *arg)
             safe_cond_wait(&s->ready, &s->ready_m);
             pthread_rwlock_rdlock(&s->rw);
             fwrite(s->result, 2, s->result_len, s->file);
-            //fflush(s->file);
             pthread_rwlock_unlock(&s->rw);
         }
     } else {
@@ -1535,7 +1531,6 @@ static void *output_thread_fn(void *arg)
             pthread_rwlock_rdlock(&s->rw);
             /* distinguish for endianness: wave requires little endian */
             waveWriteSamples(s->file, s->result, s->result_len, 0);
-            //fflush(s->file);
             pthread_rwlock_unlock(&s->rw);
         }
     }
@@ -1840,8 +1835,12 @@ void demod_cleanup(struct demod_state *s)
     pthread_mutex_destroy(&s->ready_m);
 
     pthread_cond_destroy(&s->info->cond);
-    pthread_mutex_trylock(&s->info->mutex);
-    pthread_mutex_destroy(&s->info->mutex);
+    // end thread nicely, but it doesn't matter if we can't
+    if (0 == pthread_mutex_trylock(&s->info->mutex)) {
+        pthread_mutex_unlock(&s->info->mutex);
+        pthread_mutex_destroy(&s->info->mutex);
+        pthread_join(s->info->pid, NULL);
+    }
 }
 
 void output_init(struct output_state *s)
@@ -1954,6 +1953,7 @@ int main(int argc, char **argv)
                 break;
             case 'L':
                 printLevels = (int)atof(optarg);
+                printLevels = printLevels > 9 ? printLevels : 9;
                 printLevelsMs *= printLevels;
                 pthread_create(&demod.info->pid, NULL, runPrintLevels, demod.info);
                 break;
@@ -2104,6 +2104,7 @@ int main(int argc, char **argv)
     if (!printLevelFile) {
         printLevelFile = stderr;
     }
+
     if (verbosity)
         fprintf(stderr, "verbosity set to %d\n", verbosity);
 
@@ -2260,7 +2261,6 @@ int main(int argc, char **argv)
 
     /* dongle_cleanup(&dongle); */
     demod_cleanup(&demod);
-    pthread_join(demod.info->pid, NULL);
     output_cleanup(&output);
     controller_cleanup(&controller);
 
