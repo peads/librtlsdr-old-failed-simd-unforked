@@ -1233,20 +1233,23 @@ void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
 
 void *runPrintLevels(void *ctx) {
     struct printLevelsInfo *s = (struct printLevelsInfo *) ctx;
-    struct timespec spec;
-
+    double avgRms;
+    double rmsLevel;
+    double avgRmsLevel;
+    int ret;
+    char output[256];
     while (!do_exit) {
         usleep(printLevelsMs);
         pthread_mutex_lock(&s->mutex);
 
-        clock_gettime(CLOCK_REALTIME, &spec);
-        spec.tv_sec++;
+        if (printLevelsFrames > 9 && 0 == pthread_cond_wait(&s->cond, &s->mutex)) {
+            avgRms = (double) levelSum / printLevelsFrames;
+            rmsLevel = 20.0 * log10( 1E-10 + s->sr );
+            avgRmsLevel = 20.0 * log10( 1E-10 + avgRms );
 
-        if (printLevelsFrames > 9 && 0 == pthread_cond_timedwait(&s->cond, &s->mutex, &spec)) {
-            double avgRms = (double) levelSum / printLevelsFrames;
-            double rmsLevel = 20.0 * log10( 1E-10 + s->sr );
-            double avgRmsLevel = 20.0 * log10( 1E-10 + avgRms );
-            fprintf(printLevelFile, 
+
+
+            sprintf(output,
                     "%.3f kHz, %.1f avg rms, %ld max rms, %ld max max rms, %d squelch rms, %ld rms, %.1f dB rms level, %.2f dB avg rms level\n", 
                     (double) dongle.userFreq / 1000.0,
                     avgRms, 
@@ -1256,7 +1259,18 @@ void *runPrintLevels(void *ctx) {
                     s->sr,
                     rmsLevel,
                     avgRmsLevel);
-            fflush(printLevelFile);
+            ret = fputs(output, printLevelFile);
+            if (ferror(printLevelFile)) {
+                fprintf(stderr, "I/O error when reading");
+                do_exit = 1;
+                continue;
+            } else if (feof(printLevelFile)) {
+                fprintf(stderr, "End of file reached successfully");
+                continue;
+            }
+            //fflush(stdout);
+            //fflush(stderr);
+            //fflush(printLevelFile);
             levelMax = 0;
             levelSum = 0;
             printLevelsFrames = 1;
@@ -1328,13 +1342,13 @@ void full_demod(struct demod_state *d)
             if (levelMaxMax < sr)	{
                 levelMaxMax = sr;
             }
-        
+
             info->sr = sr;
 
             pthread_cond_signal(&info->cond);
-            pthread_mutex_unlock(&info->mutex);
         }
     }
+    pthread_mutex_unlock(&info->mutex);
 
     if (c->filename) {
         if (!sr)
