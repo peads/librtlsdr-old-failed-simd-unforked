@@ -163,11 +163,13 @@ static uint32_t printLevelsMs = 1000; //in milliseconds
 static FILE *printLevelFile = NULL;
 static int32_t prev_if_band_center_freq = 0;
 
-int multiplyAndFindArgAvx(int ar, int aj, int br, int bj);
+typedef double (*argZFun)(int ar, int aj, int br, int bj);
+typedef double (*sqrtFun)(double x);
 enum trigExpr {crit_IN = 0, crit_OUT, crit_LT, crit_GT};
 char *aCritStr[] = {"in", "out", "<", ">"};
 time_t stop_time;
 int duration = 0;
+const double twoTo14OverPi = (1 << 14) * M_PI_2;
 
 struct cmd_state {
     const char *filename;
@@ -218,7 +220,7 @@ struct dongle_state {
     struct demod_state *demod_target;
     double samplePowSum;
     int samplePowCount;
-    unsigned char sampleMax;
+    char sampleMax;
 };
 
 struct printLevelsInfo {
@@ -250,7 +252,7 @@ struct demod_state {
     int post_downsample;
     uint16_t post_downsample_log2n;
     int output_scale;
-    int squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
+    int squelch_level, conseq_squelch, squelch_hits;
     int downsample_passes;
     int comp_fir_size;
     int deemph, deemph_a;
@@ -265,6 +267,8 @@ struct demod_state {
     struct output_state *output_target;
     struct cmd_state *cmd;
     struct printLevelsInfo *info;
+    argZFun fastArgZ;
+    sqrtFun fastSqrt;
 };
 
 struct output_state {
@@ -438,49 +442,38 @@ double log2(double n)
 }
 #endif
 
-#define MUL_PLUS_J_INT(X, J)    \
-    tmp = X[J]; \
-    X[J] = - X[J+1]; \
-    X[J+1] = tmp
-
-#define MUL_MINUS_ONE_INT(X, J) \
-    X[J] = - X[J]; \
-    X[J+1] = - X[J+1]
-
-#define MUL_MINUS_J_INT(X, J) \
-    tmp = X[J]; \
-    X[J] = X[J+1]; \
-    X[J+1] = -tmp
-
-typedef int (*argZFun)(int ar, int aj, int br, int bj);
-typedef float (*sqrtFun)(float x);
-
-sqrtFun fastSqrt = sqrtf;
-
-float asmSqrt(float n) {
-
-#if !defined(X86) && !defined(ARM7) && !defined(ARM64)
-    return sqrtf(n);
+extern double __asmSqrt(double n);
+__asm__ (
+#ifdef __APPLE_CC__
+"___asmSqrt: "
 #else
-    __asm__ __volatile__(
-#ifdef X86
-            "sqrtss  %0, %0"
-#else
-        "vsqrt.f32 %0 %0"
+"__asmSqrt: "
 #endif
-            : "+x" (n)
-            );
+    #ifdef X86
+        "sqrtsd  %xmm1, %xmm1\n\t"
+        "ret"
+    #else
+        "vsqrt.f64 %0 %0\n\t" // TODO FIX THIS to load paramter and return for ARM
+    #endif
+);
+static double inline asmSqrt(double n) {
 
-    return n;
+#if !defined(X86) && !defined(ARM64) || defined(_WIN32)
+    return sqrt(n);
+#else
+    return __asmSqrt(n);
 #endif
 }
 
-float sqrtApprox(float z) {
-
+static double sqrtApprox(double z) {
+#if defined(ARM64) || defined(x86_64)
+    return sqrt(z);
+#else
     union {
-        float f;
-        uint32_t i;
-    } un = {z};     /* Convert type, preserving bit pattern */
+        double f;
+        uint64_t j;
+    } un = {z};         /* Convert type, preserving bit pattern */
+
     /*
      * To justify the following code, prove that
      *
@@ -488,24 +481,62 @@ float sqrtApprox(float z) {
      *
      * where
      *
-     * b = exponent bias
-     * m = number of mantissa bits
+     * m = number of mantissa bits => 52
+     * b = exponent bias => 1023 => ((b + 1) / 2) * 2^m = (1024 * 2^(51)) = 2^(10+51) = 1 << 61
      */
-    un.i -= 1 << 23;    /* Subtract 2^m. */
-    un.i >>= 1;         /* Divide by 2. */
-    un.i += 1 << 29;    /* Add ((b + 1) / 2) * 2^m. */
+    un.j -= 1LU << 52;                /* Subtract 2^m. */
+    un.j >>= 1;                                  /* Divide by 2. */
+    un.j += 1LU << 61;                /* Add ((b + 1) / 2) * 2^m. */
 
     return un.f;        /* Interpret again as float */
+#endif
 }
+extern void swap2(void *x, void *y);
+__asm__ (
+#ifdef __APPLE_CC__
+"_swap2: "
+#else
+"swap2: "
+#endif
+    "movq (%rsi), %rax\n\t"
+    "xorq %rax, (%rdi)\n\t"
+    "xorq (%rdi), %rax\n\t"
+    "xorq %rax, (%rdi)\n\t"
+    "movq %rax, (%rsi)\n\t"
+    "ret"
+);
 
+static inline void swap(void *x, void *y) {
+
+    uintptr_t **i = (uintptr_t**)&x;
+    uintptr_t **j = (uintptr_t**)&y;
+
+    **i ^= **j;
+    **j ^= **i;
+    **i ^= **j;
+}
 void rotate16_neg90(int16_t *buf, uint32_t len) {
+    typedef void (*swapFun)(void * x, void* y);
+    static const swapFun swapper =
+#if !defined(X86) || defined(_WIN32)
+    swap;
+#else
+    swap2;
+#endif
+
     /* -90 degree rotation is 1, -j, -1, +j */
     uint32_t i;
-    int16_t tmp;
+
     for (i = 0; i < len; i += 8) {
-        MUL_MINUS_J_INT(buf, i + 2);
-        MUL_MINUS_ONE_INT(buf, i + 4);
-        MUL_PLUS_J_INT(buf, i + 6);
+
+        swapper(&buf[i+2], &buf[i+3]);
+        buf[i+3] = -buf[i+3];
+
+        buf[i+4] = -buf[i+4];
+        buf[i+5] = -buf[i+5];
+
+        swapper(&buf[i+6], &buf[i+7]);
+        buf[i+6] = -buf[i+6];
     }
 }
 
@@ -734,6 +765,7 @@ static int testTrigCrit(struct cmd_state *c, double level) {
 }
 
 static void checkTriggerCommand(struct cmd_state *c,
+                                struct demod_state *d,
                                 unsigned char adcSampleMax,
                                 double powerSum,
                                 int powerCount) {
@@ -791,7 +823,7 @@ static void checkTriggerCommand(struct cmd_state *c,
 
     adcText[0] = 0;
     if (c->checkADCmax && c->checkADCrms) {
-        adcRms = (powerCount > 0) ? fastSqrt(powerSum / powerCount) : -1.0;
+        adcRms = (powerCount > 0) ? d->fastSqrt(powerSum / powerCount) : -1.0;
         sprintf(adcText,
                 "adc max %3d%s rms %5.1f ",
                 adcMax,
@@ -803,7 +835,7 @@ static void checkTriggerCommand(struct cmd_state *c,
                 adcMax,
                 (adcMax >= 64 ? (adcMax >= 120 ? "!!" : "! ") : "  "));
     else if (c->checkADCrms) {
-        adcRms = (powerCount > 0) ? fastSqrt(powerSum / powerCount) : -1.0;
+        adcRms = (powerCount > 0) ? d->fastSqrt(powerSum / powerCount) : -1.0;
         sprintf(adcText, "adc rms %5.1f ", adcRms);
     }
 
@@ -975,29 +1007,7 @@ void generic_fir(int16_t *data, int length, int *fir, int16_t *hist)
     }
 }
 
-/* define our own complex math ops
-   because ARMv5 has no hardware float */
-void multiply(int ar, int aj, int br, int bj, int *cr, int *cj) {
-
-    *cr = ar * br - aj * bj;
-    *cj = aj * br + ar * bj;
-}
-
-argZFun fastArgz = NULL;
-
-const double twoTo14OverPi = (1 << 14) * M_PI_2;
-int polar_discriminant(int ar, int aj, int br, int bj) {
-
-    int cr, cj;
-    double angle;
-
-    multiply(ar, aj, br, -bj, &cr, &cj);
-    angle = atan2((double) cj, (double) cr);
-
-    return (int) (angle * twoTo14OverPi);
-}
-
-int multiplyAndFindArgAvx(int ar, int aj, int br, int bj) {
+static double multiplyAndFindArgAvx(int ar, int aj, int br, int bj) {
 
     double zr, zj;
 
@@ -1029,20 +1039,29 @@ int multiplyAndFindArgAvx(int ar, int aj, int br, int bj) {
     u0.vect = _mm_add_pd(u0.vect, u1a);
     u0.vect = _mm_sqrt_pd(u0.vect);
 
-    return (int) (zj < 0 ? -acos(zr / u0.vect[1]) : acos(zr / u0.vect[1]) * twoTo14OverPi);
+    return zj < 0 ? -acos(zr / u0.vect[1]) : acos(zr / u0.vect[1]);
 }
 
-void fm_demod(struct demod_state *fm) {
+static inline double polar_discriminant(int ar, int aj, int br, int bj) {
 
-    int i, pcm;
+    return atan2((double) (ar * br - aj * bj), (double) (aj * br + ar * bj));;
+}
+
+static inline double argZ(argZFun fun, int xr, int xj, int yr, int yj) {
+
+    return twoTo14OverPi * fun(xr,xj,-yr,yj);
+}
+static void fm_demod(struct demod_state *fm) {
+
+    int i;
+    int16_t pcm;
     int16_t *lp = fm->lowpassed;
-    pcm = fastArgz(lp[0], lp[1],
-                   fm->pre_r, fm->pre_j);
+    pcm = argZ(fm->fastArgZ, lp[0], lp[1], fm->pre_r, fm->pre_j);
 
     fm->result[0] = (int16_t) pcm;
     for (i = 2; i < (fm->lp_len - 1); i += 2) {
 
-        pcm = fastArgz(lp[i], lp[i + 1], lp[i - 2], lp[i - 1]);
+        pcm = argZ(fm->fastArgZ, lp[i], lp[i + 1], lp[i - 2], lp[i - 1]);
         fm->result[i >> 1] = (int16_t) pcm;
     }
     fm->pre_r = lp[fm->lp_len - 2];
@@ -1054,7 +1073,8 @@ void am_demod(struct demod_state *fm)
 /* todo, fix this extreme laziness */
 {
 
-    int i, pcm;
+    int i;
+    int16_t pcm;
     int16_t *lp = fm->lowpassed;
     int16_t *r = fm->result;
     for (i = 0; i < fm->lp_len; i += 2) {
@@ -1063,7 +1083,7 @@ void am_demod(struct demod_state *fm)
         */
         pcm = lp[i] * lp[i];
         pcm += lp[i + 1] * lp[i + 1];
-        r[i >> 1] = (int16_t) fastSqrt(pcm) * fm->output_scale;
+        r[i >> 1] = fm->fastSqrt(pcm) * fm->output_scale;
     }
     fm->result_len = (fm->lp_len >> 1);
     /* lowpass? (3khz)  highpass?  (dc) */
@@ -1071,24 +1091,26 @@ void am_demod(struct demod_state *fm)
 
 void usb_demod(struct demod_state *fm) {
 
-    int i, pcm;
+    int i;
+    int16_t pcm;
     int16_t *lp = fm->lowpassed;
     int16_t *r = fm->result;
     for (i = 0; i < fm->lp_len; i += 2) {
         pcm = lp[i] + lp[i + 1];
-        r[i >> 1] = (int16_t) pcm * fm->output_scale;
+        r[i >> 1] = pcm * fm->output_scale;
     }
     fm->result_len = (fm->lp_len >> 1);
 }
 
 void lsb_demod(struct demod_state *fm) {
 
-    int i, pcm;
+    int i;
+    int16_t pcm;
     int16_t *lp = fm->lowpassed;
     int16_t *r = fm->result;
     for (i = 0; i < fm->lp_len; i += 2) {
         pcm = lp[i] - lp[i + 1];
-        r[i >> 1] = (int16_t) pcm * fm->output_scale;
+        r[i >> 1] = pcm * fm->output_scale;
     }
     fm->result_len = (fm->lp_len >> 1);
 }
@@ -1135,36 +1157,32 @@ void dc_block_audio_filter(struct demod_state *fm) {
     fm->dc_avg = avg;
 }
 
-void dc_block_raw_filter(struct demod_state *fm, int16_t *buf, int len) {
+static void dc_block_raw_filter(struct demod_state *fm, short *buf, int len) {
     /* derived from dc_block_audio_filter,
         running over the raw I/Q components
     */
-    const double rRdcBlock = 1.0 / (fm->rdc_block_const + 1);
-    const double rLen = 1.0 / (len >> 1);
 
-    int i, avgI, avgQ;
-    int64_t sumI = 0;
-    int64_t sumQ = 0;
+    int i, avgI, avgQ, sumI = 0, sumQ = 0;
     for (i = 0; i < len; i += 2) {
         sumI += buf[i];
         sumQ += buf[i + 1];
     }
-    avgI = sumI * rLen;
-    avgQ = sumQ * rLen;
-    avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) * rRdcBlock;
-    avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) * rRdcBlock;
+    avgI = sumI / (len >> 1);
+    avgQ = sumQ / (len >> 1);
+    avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) / (fm->rdc_block_const + 1);
+    avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) / (fm->rdc_block_const + 1);
     for (i = 0; i < len; i += 2) {
-        buf[i] -= avgI;
-        buf[i + 1] -= avgQ;
+        buf[i] = (short) (buf[i] - avgI);
+        buf[i + 1] = (short) (buf[i+1] - avgQ);
     }
     fm->dc_avgI = avgI;
     fm->dc_avgQ = avgQ;
 }
 
-int rms(const int16_t *samples, int len, int step, int omitDCfix)
+int rms(struct demod_state *d, int step)
 /* largely lifted from rtl_power */
 {
-
+    //rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
     const int stepConst = step << 15; //step * 32768;
 
     double dc;
@@ -1176,28 +1194,30 @@ int rms(const int16_t *samples, int len, int step, int omitDCfix)
     uint32_t p = 0;  /* use sign bit to prevent overflow */
 
 
-    if (len > stepConst) { /* 8 bit squared = 16 bit. limit to 2^16 for 32 bit squared sum */
-        step = len / stepConst + 1;
+    if (d->lp_len > stepConst) { /* 8 bit squared = 16 bit. limit to 2^16 for 32 bit squared sum */
+        step = d->lp_len / stepConst + 1;
     }  /* increase step to prevent overflow */
 
-    for (i = 0; i < len; i += step) {
-        const int32_t s = (long) samples[i];
+    for (i = 0; i < d->lp_len; i += step) {
+        const int32_t s = d->lowpassed[i];
         t += s;
         p += s * s;
     }
 
-    if (omitDCfix) {
+    if (d->dc_block_raw) {
         /* DC is already corrected. No need to do it again */
-        num = len / step;
-        return (int) fastSqrt((double) (p) / num);
+        num = d->lp_len / step;
+        return (int) d->fastSqrt((double) (p) / num);
     }
 
     /* correct for dc offset in squares */
     tstep = (double) (t * step);
-    dc = tstep / (double) len;
-    err = dc * ((t << 1) - tstep); // <= t * 2 * dc - dc * dc * len = t * 2 * dc - dc * (tstep / len) * len = dc * (2*t - tstep / len * len);
+    dc = tstep / (double) d->lp_len;
+    err = dc * ((t << 1) - tstep);
+    // <= t * 2 * dc - dc * dc * len = t * 2 * dc - dc * (tstep / len) * len
+    // = dc * (2*t - tstep / len * len);
 
-    return (int) fastSqrt((p - err) / len);
+    return (int) d->fastSqrt((p - err) / d->lp_len);
 }
 
 static void *runPrintLevels(void *ctx) {
@@ -1220,7 +1240,7 @@ static void *runPrintLevels(void *ctx) {
 
 
             sprintf(printLevelsOutput,
-                    "%.3f kHz, %.1Lf avg rms, %lu max rms, %lu max max rms, %d squelch rms, %lu rms, %.1Lf dB rms level, %.2Lf dB avg rms level\n",
+                    "%.3f kHz, %.1Lf avg rms, %llu max rms, %llu max max rms, %d squelch rms, %llu rms, %.1Lf dB rms level, %.2Lf dB avg rms level\n",
                     (double) dongle.userFreq / 1000.0,
                     avgRms,
                     levelMax,
@@ -1277,7 +1297,7 @@ void full_demod(struct demod_state *d) {
     }
     /* power squelch */
     if (d->squelch_level) {
-        sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+        sr = rms(d, 1);
         if (sr >= 0) {
             if (sr >= d->squelch_level) {
                 d->squelch_hits = 0;
@@ -1291,7 +1311,7 @@ void full_demod(struct demod_state *d) {
     if (printLevels) {
 
         if (!sr) {
-            sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+            sr = rms(d, 1);
         }
 
         if (sr >= 0) {
@@ -1317,7 +1337,7 @@ void full_demod(struct demod_state *d) {
 
     if (c->filename) {
         if (!sr) {
-            sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
+            sr = rms(d, 1);
         }
         if (printBlockLen && verbosity) {
             fprintf(stderr, "block length for rms after decimation is %d samples\n", d->lp_len);
@@ -1479,7 +1499,7 @@ static void *demod_thread_fn(void *arg) {
         }
 
         if (c->filename && c->numSummed >= c->numMeas) {
-            checkTriggerCommand(c, dongle.sampleMax, dongle.samplePowSum, dongle.samplePowCount);
+            checkTriggerCommand(c, d,dongle.sampleMax, dongle.samplePowSum, dongle.samplePowCount);
 
             safe_cond_signal(&controller.hop, &controller.hop_m);
             continue;
@@ -1824,7 +1844,7 @@ void demod_init(struct demod_state *s) {
     s->rate_out = DEFAULT_SAMPLE_RATE;
     s->squelch_level = 0;
     s->conseq_squelch = 10;
-    s->terminate_on_squelch = 0;
+//    s->terminate_on_squelch = 0;
     s->squelch_hits = 11;
     s->downsample_passes = 0;
     s->comp_fir_size = 0;
@@ -1943,6 +1963,9 @@ int main(int argc, char **argv) {
     controller_init(&controller);
     cmd_init(&cmd);
 
+    demod.fastSqrt = sqrt;
+    demod.fastArgZ = polar_discriminant;
+
     while ((opt = getopt(argc,
                          argv,
                          "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:P:q:c:w:W:X:D:nHv")) != -1) {
@@ -1982,13 +2005,10 @@ int main(int argc, char **argv) {
                 setvbuf(printLevelFile, NULL, _IONBF, 0);
                 break;
             case 'X':
-                switch ((int) atof(optarg)) {
-                    case 0:fastSqrt = asmSqrt;
-                        break;
-                    case 1:fastSqrt = sqrtApprox;
-                        break;
-                    default:fastSqrt = sqrtf;
-                        break;
+                if (!strcmp("asm", optarg)) {
+                    demod.fastSqrt = asmSqrt;
+                } else if (!strcmp("aprx", optarg)) {
+                    demod.fastSqrt = sqrtApprox;
                 }
                 break;
             case 's':demod.rate_in = (uint32_t) atofs(optarg);
@@ -2012,7 +2032,7 @@ int main(int argc, char **argv) {
             case 't': demod.conseq_squelch = (int) atof(optarg);
                 if (demod.conseq_squelch < 0) {
                     demod.conseq_squelch = -demod.conseq_squelch;
-                    demod.terminate_on_squelch = 1;
+//                    demod.terminate_on_squelch = 1;
                 }
                 break;
             case 'p': dongle.ppm_error = atoi(optarg);
@@ -2071,16 +2091,14 @@ int main(int argc, char **argv) {
                 break;
             case 'A':
                 if (!strcmp("std", optarg)) {
-                    fastArgz = polar_discriminant;
+                    demod.fastArgZ = polar_discriminant;
                 } else if (!strcmp("avx", optarg)) {
-                    fastArgz = multiplyAndFindArgAvx;
+                    demod.fastArgZ = multiplyAndFindArgAvx;
                 }
                 break;
             case 'M':
-                if (strcmp("nbfm", optarg) == 0 || strcmp("nfm", optarg) == 0 || strcmp("fm",
-                                                                                        optarg) == 0) {
+                if (strcmp("nbfm", optarg) == 0 || strcmp("nfm", optarg) == 0 || strcmp("fm",optarg) == 0) {
                     demod.mode_demod = &fm_demod;
-                    fastArgz = multiplyAndFindArgAvx;
                 }
                 if (strcmp("raw", optarg) == 0 || strcmp("iq", optarg) == 0) {
                     demod.mode_demod = &raw_demod;
@@ -2157,9 +2175,9 @@ int main(int argc, char **argv) {
 
     sanity_checks();
 
-    if (controller.freq_len > 1) {
-        demod.terminate_on_squelch = 0;
-    }
+//    if (controller.freq_len > 1) {
+//        demod.terminate_on_squelch = 0;
+//    }
 
     if (optind < argc) {
         output.filename = argv[optind];
@@ -2273,7 +2291,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-    fastArgz = polar_discriminant;
     //r = rtlsdr_set_testmode(dongle.dev, 1);
 
     /* Reset endpoint before we start reading from it (mandatory) */
