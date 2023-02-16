@@ -165,6 +165,8 @@ static int32_t prev_if_band_center_freq = 0;
 
 typedef double (*argZFun)(int ar, int aj, int br, int bj);
 typedef double (*sqrtFun)(double x);
+typedef void (*swapFun)(void * x, void* y);
+
 enum trigExpr {crit_IN = 0, crit_OUT, crit_LT, crit_GT};
 char *aCritStr[] = {"in", "out", "<", ">"};
 time_t stop_time;
@@ -269,6 +271,7 @@ struct demod_state {
     struct printLevelsInfo *info;
     argZFun fastArgZ;
     sqrtFun fastSqrt;
+    swapFun swapper;
 };
 
 struct output_state {
@@ -453,10 +456,10 @@ __asm__ (
         "sqrtsd  %xmm1, %xmm1\n\t"
         "ret"
     #else
-        "vsqrt.f64 %0 %0\n\t" // TODO FIX THIS to load paramter and return for ARM
+        "vsqrt.f64 d9, d9\n\t" // TODO FIX THIS to load paramter and return for ARM
     #endif
 );
-static double inline asmSqrt(double n) {
+static inline double asmSqrt(double n) {
 
 #if !defined(X86) && !defined(ARM64) || defined(_WIN32)
     return sqrt(n);
@@ -466,9 +469,7 @@ static double inline asmSqrt(double n) {
 }
 
 static double sqrtApprox(double z) {
-#if defined(ARM64) || defined(x86_64)
-    return sqrt(z);
-#else
+
     union {
         double f;
         uint64_t j;
@@ -489,8 +490,8 @@ static double sqrtApprox(double z) {
     un.j += 1LU << 61;                /* Add ((b + 1) / 2) * 2^m. */
 
     return un.f;        /* Interpret again as float */
-#endif
 }
+
 extern void swap2(void *x, void *y);
 __asm__ (
 #ifdef __APPLE_CC__
@@ -506,36 +507,27 @@ __asm__ (
     "ret"
 );
 
-static inline void swap(void *x, void *y) {
+static void swap1a(void *x, void *y) {
 
-    uintptr_t **i = (uintptr_t**)&x;
-    uintptr_t **j = (uintptr_t**)&y;
-
-    **i ^= **j;
-    **j ^= **i;
-    **i ^= **j;
+    uintptr_t temp = *(uintptr_t *) x;
+    **((uintptr_t **) &x) = **((uintptr_t **) &y);
+    *(uintptr_t *) y = *((uintptr_t *) &temp);
 }
-void rotate16_neg90(int16_t *buf, uint32_t len) {
-    typedef void (*swapFun)(void * x, void* y);
-    static const swapFun swapper =
-#if !defined(X86) || defined(_WIN32)
-    swap;
-#else
-    swap2;
-#endif
+
+void rotate16_neg90(struct demod_state *d, int16_t *buf, uint32_t len) {
 
     /* -90 degree rotation is 1, -j, -1, +j */
     uint32_t i;
 
     for (i = 0; i < len; i += 8) {
 
-        swapper(&buf[i+2], &buf[i+3]);
+        d->swapper(&buf[i+2], &buf[i+3]);
         buf[i+3] = -buf[i+3];
 
         buf[i+4] = -buf[i+4];
         buf[i+5] = -buf[i+5];
 
-        swapper(&buf[i+6], &buf[i+7]);
+        d->swapper(&buf[i+6], &buf[i+7]);
         buf[i+6] = -buf[i+6];
     }
 }
@@ -1459,7 +1451,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
     }    /* "mute" after the dc_block_raw_filter(), giving it time to remove the new DC */
     /* 3rd: down-mixing */
     if (!s->offset_tuning) {
-        rotate16_neg90(s->buf16, (int) len);
+        rotate16_neg90(d, s->buf16, (int) len);
     }
     pthread_rwlock_wrlock(&d->rw);
     memcpy(d->lowpassed, s->buf16, (len << 1));
@@ -1965,10 +1957,15 @@ int main(int argc, char **argv) {
 
     demod.fastSqrt = sqrt;
     demod.fastArgZ = polar_discriminant;
+#ifndef X86    
+    demod.swapper = swap1a;
+#else
+    demod.swapper = swap2;
+#endif
 
     while ((opt = getopt(argc,
                          argv,
-                         "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:P:q:c:w:W:X:D:nHv")) != -1) {
+                         "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:P:q:c:w:W:X:G:D:nHv")) != -1) {
         switch (opt) {
             case 'd': dongle.dev_index = verbose_device_search(optarg);
                 dev_given = 1;
@@ -2010,6 +2007,17 @@ int main(int argc, char **argv) {
                 } else if (!strcmp("aprx", optarg)) {
                     demod.fastSqrt = sqrtApprox;
                 }
+                break;
+            case 'G':
+#ifndef X86
+                demod.swapper = swap1a;
+#else
+                if (!strcmp("asm", optarg)) {
+                    demod.swapper = swap2;
+                } else if (!strcmp("cla", optarg)) {
+                    demod.swapper = swap1a;
+                }
+#endif
                 break;
             case 's':demod.rate_in = (uint32_t) atofs(optarg);
                 demod.rate_out = (uint32_t) atofs(optarg);
