@@ -53,4 +53,7 @@ src/rtl_test
 
 debianize/*.deb
 .cproject
-.project
+.project.idea/
+cmake-build-debug/
+.idea/
+

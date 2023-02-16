@@ -81,22 +81,69 @@
 
 #include <math.h>
 #include <pthread.h>
-#include <libusb.h>
-
+#include <immintrin.h>
 #include <rtl-sdr.h>
 #include <rtl_app_ver.h>
 #include "convenience/convenience.h"
 #include "convenience/rtl_convenience.h"
 #include "convenience/wavewrite.h"
 
-#define DEFAULT_SAMPLE_RATE        24000
-#define DEFAULT_BUF_LENGTH        (1 * 16384)
-#define MAXIMUM_OVERSAMPLE        16
-#define MAXIMUM_BUF_LENGTH        (MAXIMUM_OVERSAMPLE * DEFAULT_BUF_LENGTH)
-#define AUTO_GAIN                -100
-#define DEFAULT_BUFFER_DUMP        4096
 
-#define FREQUENCIES_LIMIT        1024
+#if defined(__x86_64__) || defined(_M_X64)
+    #define x86_64
+    #define X86
+#elif defined(i386) || defined(__i386__) || defined(__i386) || defined(_M_IX86)
+    #define x86_32
+    #define X86
+#elif defined(__ARM_ARCH_2__)
+    #define ARM
+    #define ARM2
+#elif defined(__ARM_ARCH_3__) || defined(__ARM_ARCH_3M__)
+    #define ARM
+    #define ARM3
+#elif defined(__ARM_ARCH_4T__) || defined(__TARGET_ARM_4T)
+    #define ARM
+    #define ARM4T
+#elif defined(__ARM_ARCH_5_) || defined(__ARM_ARCH_5E_)
+    #define ARM
+    #define ARM5
+#elif defined(__ARM_ARCH_6T2_) || defined(__ARM_ARCH_6T2_)
+    #define ARM
+    #define ARM6T2
+#elif defined(__ARM_ARCH_6__) || defined(__ARM_ARCH_6J__) || defined(__ARM_ARCH_6K__) || defined(__ARM_ARCH_6Z__) || defined(__ARM_ARCH_6ZK__)
+    #define ARM
+    #define ARM6
+#elif defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7R__) || defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7S__)
+    #define ARM
+    #define ARM7
+#elif defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7R__) || defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7S__)
+    #define ARM
+    #define ARM7
+    #define ARM7A
+#elif defined(__ARM_ARCH_7R__) || defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7S__)
+    #define ARM
+    #define ARM7
+    #define ARM7R
+#elif defined(__ARM_ARCH_7M__)
+    #define ARM
+    #define ARM7
+    #define ARM7M
+#elif defined(__ARM_ARCH_7S__)
+    #define ARM
+    #define ARM7
+    #define ARM7S
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #define ARM
+    #define ARM64
+#endif
+
+#define DEFAULT_SAMPLE_RATE         24000
+#define DEFAULT_BUF_LENGTH_BITS     14
+#define MAXIMUM_OVERSAMPLE          16
+#define MAXIMUM_BUF_LENGTH          (MAXIMUM_OVERSAMPLE << DEFAULT_BUF_LENGTH_BITS)
+#define AUTO_GAIN                   -100
+#define DEFAULT_BUFFER_DUMP         4096
+#define FREQUENCIES_LIMIT           1024
 
 static int BufferDump = DEFAULT_BUFFER_DUMP;
 static int OutputToStdout = 1;
@@ -105,10 +152,6 @@ static int MinCaptureRate = 1000000;
 static volatile int do_exit = 0;
 static int lcm_post[17] = {1, 1, 1, 3, 1, 5, 3, 7, 1, 9, 5, 11, 3, 13, 7, 15, 1};
 static int ACTUAL_BUF_LENGTH;
-
-static int *atan_lut = NULL;
-static int atan_lut_size = 131072; /* 512 KB */
-static int atan_lut_coef = 8;
 
 static int verbosity = 0;
 static uint16_t printLevels = 0;
@@ -120,9 +163,9 @@ static uint32_t printLevelsMs = 1000; //in milliseconds
 static FILE *printLevelFile = NULL;
 static int32_t prev_if_band_center_freq = 0;
 
+int multiplyAndFindArgAvx(int ar, int aj, int br, int bj);
 enum trigExpr {crit_IN = 0, crit_OUT, crit_LT, crit_GT};
 char *aCritStr[] = {"in", "out", "<", ">"};
-
 time_t stop_time;
 int duration = 0;
 
@@ -157,7 +200,6 @@ struct cmd_state {
 };
 
 struct dongle_state {
-    int exit_flag;
     pthread_t thread;
     rtlsdr_dev_t *dev;
     int dev_index;
@@ -204,13 +246,13 @@ struct demod_state {
     int now_r, now_j;
     int pre_r, pre_j;
     int prev_index;
-    int downsample;    /* min 1, max 256 */
+    uint8_t downsample;    /* min 1, max 256 */
     int post_downsample;
+    uint16_t post_downsample_log2n;
     int output_scale;
     int squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
     int downsample_passes;
     int comp_fir_size;
-    int custom_atan;
     int deemph, deemph_a;
     int now_lpr;
     int prev_lpr_index;
@@ -226,7 +268,6 @@ struct demod_state {
 };
 
 struct output_state {
-    int exit_flag;
     pthread_t thread;
     FILE *file;
     char *filename;
@@ -240,7 +281,6 @@ struct output_state {
 };
 
 struct controller_state {
-    int exit_flag;
     pthread_t thread;
     uint32_t freqs[FREQUENCIES_LIMIT];
     int freq_len;
@@ -398,27 +438,6 @@ double log2(double n)
 }
 #endif
 
-
-/* uint8_t negation = 255 - x */
-#define NEG_U8(x)     ( 255 - x )
-/* MUL_PLUS_J:    (a + j*b ) * j =  -b + j *  a */
-/* MUL_MINUS_ONE: (a + j*b ) * -1 = -a + j * -b */
-/* MUL_MINUS_J:   (a + j*b ) * -j =  b + j * -a */
-#define MUL_PLUS_J_U8(X, J)    \
-    tmp = X[J]; \
-    X[J] = NEG_U8( X[J+1] ); \
-    X[J+1] = tmp
-
-#define MUL_MINUS_ONE_U8(X, J) \
-    X[J] = NEG_U8( X[J] ); \
-    X[J+1] = NEG_U8( X[J+1] )
-
-#define MUL_MINUS_J_U8(X, J) \
-    tmp = X[J]; \
-    X[J] = X[J+1]; \
-    X[J+1] = NEG_U8( tmp )
-
-
 #define MUL_PLUS_J_INT(X, J)    \
     tmp = X[J]; \
     X[J] = - X[J+1]; \
@@ -433,16 +452,50 @@ double log2(double n)
     X[J] = X[J+1]; \
     X[J+1] = -tmp
 
+typedef int (*argZFun)(int ar, int aj, int br, int bj);
+typedef float (*sqrtFun)(float x);
 
-void rotate16_90(int16_t *buf, uint32_t len) {
-    /* 90 degree rotation is 1, +j, -1, -j */
-    uint32_t i;
-    int16_t tmp;
-    for (i = 0; i < len; i += 8) {
-        MUL_PLUS_J_INT(buf, i + 2);
-        MUL_MINUS_ONE_INT(buf, i + 4);
-        MUL_MINUS_J_INT(buf, i + 6);
-    }
+sqrtFun fastSqrt = sqrtf;
+
+float asmSqrt(float n) {
+
+#if !defined(X86) && !defined(ARM7) && !defined(ARM64)
+    return sqrtf(n);
+#else
+    __asm__ __volatile__(
+#ifdef X86
+            "sqrtss  %0, %0"
+#else
+        "vsqrt.f32 %0 %0"
+#endif
+            : "+x" (n)
+            );
+
+    return n;
+#endif
+}
+
+float sqrtApprox(float z) {
+
+    union {
+        float f;
+        uint32_t i;
+    } un = {z};     /* Convert type, preserving bit pattern */
+    /*
+     * To justify the following code, prove that
+     *
+     * ((((val.i / 2^m) - b) / 2) + b) * 2^m = ((val.i - 2^m) / 2) + ((b + 1) / 2) * 2^m)
+     *
+     * where
+     *
+     * b = exponent bias
+     * m = number of mantissa bits
+     */
+    un.i -= 1 << 23;    /* Subtract 2^m. */
+    un.i >>= 1;         /* Divide by 2. */
+    un.i += 1 << 29;    /* Add ((b + 1) / 2) * 2^m. */
+
+    return un.f;        /* Interpret again as float */
 }
 
 void rotate16_neg90(int16_t *buf, uint32_t len) {
@@ -454,51 +507,6 @@ void rotate16_neg90(int16_t *buf, uint32_t len) {
         MUL_MINUS_ONE_INT(buf, i + 4);
         MUL_PLUS_J_INT(buf, i + 6);
     }
-}
-
-void rotate_90(unsigned char *buf, uint32_t len) {
-    /* 90 degree rotation is 1, +j, -1, -j */
-    uint32_t i;
-    unsigned char tmp;
-    for (i = 0; i < len; i += 8) {
-        MUL_PLUS_J_U8(buf, i + 2);
-        MUL_MINUS_ONE_U8(buf, i + 4);
-        MUL_MINUS_J_U8(buf, i + 6);
-    }
-}
-
-void rotate_neg90(unsigned char *buf, uint32_t len) {
-    /* -90 degree rotation is 1, -j, -1, +j */
-    uint32_t i;
-    unsigned char tmp;
-    for (i = 0; i < len; i += 8) {
-        MUL_MINUS_J_U8(buf, 2);
-        MUL_MINUS_ONE_U8(buf, 4);
-        MUL_PLUS_J_U8(buf, 6);
-    }
-}
-
-void low_pass(struct demod_state *d)
-/* simple square window FIR */
-{
-
-    int i = 0, i2 = 0;
-    while (i < d->lp_len) {
-        d->now_r += d->lowpassed[i];
-        d->now_j += d->lowpassed[i + 1];
-        i += 2;
-        d->prev_index++;
-        if (d->prev_index < d->downsample) {
-            continue;
-        }
-        d->lowpassed[i2] = d->now_r; /* * d->output_scale; */
-        d->lowpassed[i2 + 1] = d->now_j; /* * d->output_scale; */
-        d->prev_index = 0;
-        d->now_r = 0;
-        d->now_j = 0;
-        i2 += 2;
-    }
-    d->lp_len = i2;
 }
 
 static char *trim(char *s) {
@@ -612,10 +620,11 @@ static int toNextCmdLine(struct cmd_state *c) {
             continue;
         }
         pCmdGain = trim(pCmdGain);
-        if (!strcmp(pCmdGain, "auto") || !strcmp(pCmdGain, "a"))
+        if (!strcmp(pCmdGain, "auto") || !strcmp(pCmdGain, "a")) {
             c->gain = AUTO_GAIN;
-        else
+        } else {
             c->gain = (int) (atof(pCmdGain) * 10);
+        }
 
         pCmdTrigCrit = strtok(NULL, delim);
         if (!pCmdTrigCrit) {
@@ -625,15 +634,15 @@ static int toNextCmdLine(struct cmd_state *c) {
             continue;
         }
         pCmdTrigCrit = trim(pCmdTrigCrit);
-        if (!strcmp(pCmdTrigCrit, "in")) c->trigCrit = crit_IN;
-        else if (!strcmp(pCmdTrigCrit, "==")) c->trigCrit = crit_IN;
-        else if (!strcmp(pCmdTrigCrit, "out")) c->trigCrit = crit_OUT;
-        else if (!strcmp(pCmdTrigCrit, "!=")) c->trigCrit = crit_OUT;
-        else if (!strcmp(pCmdTrigCrit, "<>")) c->trigCrit = crit_OUT;
-        else if (!strcmp(pCmdTrigCrit, "lt")) c->trigCrit = crit_LT;
-        else if (!strcmp(pCmdTrigCrit, "<")) c->trigCrit = crit_LT;
-        else if (!strcmp(pCmdTrigCrit, "gt")) c->trigCrit = crit_GT;
-        else if (!strcmp(pCmdTrigCrit, ">")) c->trigCrit = crit_GT;
+        if (!strcmp(pCmdTrigCrit, "in")) {c->trigCrit = crit_IN;}
+        else if (!strcmp(pCmdTrigCrit, "==")) {c->trigCrit = crit_IN;}
+        else if (!strcmp(pCmdTrigCrit, "out")) {c->trigCrit = crit_OUT;}
+        else if (!strcmp(pCmdTrigCrit, "!=")) {c->trigCrit = crit_OUT;}
+        else if (!strcmp(pCmdTrigCrit, "<>")) {c->trigCrit = crit_OUT;}
+        else if (!strcmp(pCmdTrigCrit, "lt")) {c->trigCrit = crit_LT;}
+        else if (!strcmp(pCmdTrigCrit, "<")) {c->trigCrit = crit_LT;}
+        else if (!strcmp(pCmdTrigCrit, "gt")) {c->trigCrit = crit_GT;}
+        else if (!strcmp(pCmdTrigCrit, ">")) {c->trigCrit = crit_GT;}
         else {
             fprintf(stderr, "error parsing expr in line %d of command file!\n", c->lineNo);
             continue;
@@ -684,15 +693,17 @@ static int toNextCmdLine(struct cmd_state *c) {
 
         c->command = strtok(NULL, delim);
         /* no check: allow empty string. just trim it */
-        if (c->command)
+        if (c->command) {
             c->command = trim(c->command);
+        }
 
         c->args = strtok(NULL, delim);
         /* no check: allow empty string. just trim it */
-        if (c->args)
+        if (c->args) {
             c->args = trim(c->args);
+        }
 
-        if (verbosity >= 2)
+        if (verbosity >= 2) {
             fprintf(stderr,
                     "read from cmd file: freq %.3f kHz, gain %0.1f dB, level %s {%.1f +/- %.1f}, cmd '%s %s'\n",
                     c->freq / 1000.0,
@@ -702,6 +713,7 @@ static int toNextCmdLine(struct cmd_state *c) {
                     c->refLevelTol,
                     (c->command ? c->command : "%"),
                     (c->args ? c->args : ""));
+        }
 
         numValidLines++;
         return 1;
@@ -779,7 +791,7 @@ static void checkTriggerCommand(struct cmd_state *c,
 
     adcText[0] = 0;
     if (c->checkADCmax && c->checkADCrms) {
-        adcRms = (powerCount > 0) ? sqrt(powerSum / powerCount) : -1.0;
+        adcRms = (powerCount > 0) ? fastSqrt(powerSum / powerCount) : -1.0;
         sprintf(adcText,
                 "adc max %3d%s rms %5.1f ",
                 adcMax,
@@ -791,7 +803,7 @@ static void checkTriggerCommand(struct cmd_state *c,
                 adcMax,
                 (adcMax >= 64 ? (adcMax >= 120 ? "!!" : "! ") : "  "));
     else if (c->checkADCrms) {
-        adcRms = (powerCount > 0) ? sqrt(powerSum / powerCount) : -1.0;
+        adcRms = (powerCount > 0) ? fastSqrt(powerSum / powerCount) : -1.0;
         sprintf(adcText, "adc rms %5.1f ", adcRms);
     }
 
@@ -826,21 +838,29 @@ static void checkTriggerCommand(struct cmd_state *c,
     c->numSummed++;
 }
 
-int low_pass_simple(int16_t *signal2, int len, int step)
-/* no wrap around, length must be multiple of step */
+void low_pass(struct demod_state *d)
+/* simple square window FIR */
 {
 
-    int i, i2, sum;
-    for (i = 0; i < len; i += step) {
-        sum = 0;
-        for (i2 = 0; i2 < step; i2++) {
-            sum += (int) signal2[i + i2];
+    int i = 0, i2 = 0;
+
+    for (; i < d->lp_len; i += 2) {
+
+        d->now_r += d->lowpassed[i];
+        d->now_j += d->lowpassed[i + 1];
+
+        if (++d->prev_index < d->downsample) {
+            continue;
         }
-        /* signal2[i/step] = (int16_t)(sum / step); */
-        signal2[i / step] = (int16_t) (sum);
+        d->lowpassed[i2] = d->now_r; /* * d->output_scale; */
+        d->lowpassed[i2 + 1] = d->now_j; /* * d->output_scale; */
+
+        d->prev_index = 0;
+        d->now_r = 0;
+        d->now_j = 0;
+        i2 += 2;
     }
-    signal2[i / step + 1] = signal2[i / step];
-    return len / step;
+    d->lp_len = i2;
 }
 
 void low_pass_real(struct demod_state *s)
@@ -848,22 +868,53 @@ void low_pass_real(struct demod_state *s)
 /* add support for upsampling? */
 {
 
+    const int fast = s->rate_out;
+    const int slow = s->rate_out2;
+    const float ratio = (float) slow / (float) fast;
+
     int i = 0, i2 = 0;
-    int fast = (int) s->rate_out;
-    int slow = s->rate_out2;
-    while (i < s->result_len) {
+
+    for (; i < s->result_len; ++i) {
+
         s->now_lpr += s->result[i];
-        i++;
         s->prev_lpr_index += slow;
+
         if (s->prev_lpr_index < fast) {
             continue;
         }
-        s->result[i2] = (int16_t) (s->now_lpr / (fast / slow));
+
+        s->result[i2] = (int16_t) (s->now_lpr * ratio);
         s->prev_lpr_index -= fast;
         s->now_lpr = 0;
         i2 += 1;
     }
     s->result_len = i2;
+}
+
+int low_pass_simple(int16_t *signal2, int len, int step, int log2Step)
+/* no wrap around, length must be multiple of step */
+{
+
+    const float oneOverStep = 1.0f / step;
+
+    int i, i2, sum;
+    int i_step = 1; // i_step = i / 2^n = i >> n
+
+    for (i = 0; i < len; i += step) {
+
+        i_step = i >> log2Step;
+        sum = 0;
+
+        for (i2 = 0; i2 < step; i2++) {
+            sum += (int) signal2[i + i2];
+        }
+
+        /* signal2[i/step] = (int16_t)(sum / step); */
+        signal2[i_step] = (int16_t) (sum * oneOverStep);
+    }
+
+    signal2[i_step + 1] = signal2[i_step];
+    return len >> log2Step;
 }
 
 void fifth_order(int16_t *data, int length, int16_t *hist)
@@ -879,7 +930,7 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
     e = hist[5];
     f = data[0];
     /* a downsample should improve resolution, so don't fully shift */
-    data[0] = (a + (b + e) * 5 + (c + d) * 10 + f) >> 4;
+    data[0] = (a + 5 * (b + ((c + d) << 1) + e) + f) >> 4; // (a + (b + e) * 5 + (c + d) * 10 + f) >> 4
     for (i = 4; i < length; i += 4) {
         a = c;
         b = d;
@@ -887,7 +938,7 @@ void fifth_order(int16_t *data, int length, int16_t *hist)
         d = f;
         e = data[i - 2];
         f = data[i];
-        data[i / 2] = (a + (b + e) * 5 + (c + d) * 10 + f) >> 4;
+        data[i >> 1] = (a + 5 * (b + ((c + d) << 1) + e) + f) >> 4; // (a + 5 (b + 2 (c + d) + e) + f) >> 4
     }
     /* archive */
     hist[0] = a;
@@ -926,149 +977,77 @@ void generic_fir(int16_t *data, int length, int *fir, int16_t *hist)
 
 /* define our own complex math ops
    because ARMv5 has no hardware float */
-
 void multiply(int ar, int aj, int br, int bj, int *cr, int *cj) {
 
     *cr = ar * br - aj * bj;
     *cj = aj * br + ar * bj;
 }
 
+argZFun fastArgz = NULL;
+
+const double twoTo14OverPi = (1 << 14) * M_PI_2;
 int polar_discriminant(int ar, int aj, int br, int bj) {
 
     int cr, cj;
     double angle;
+
     multiply(ar, aj, br, -bj, &cr, &cj);
     angle = atan2((double) cj, (double) cr);
-    return (int) (angle / 3.14159 * (1 << 14));
+
+    return (int) (angle * twoTo14OverPi);
 }
 
-int fast_atan2(int y, int x)
-/* pre scaled for int16 */
-{
+int multiplyAndFindArgAvx(int ar, int aj, int br, int bj) {
 
-    int yabs, angle;
-    int pi4 = (1 << 12), pi34 = 3 * (1 << 12);  /* note pi = 1<<14 */
-    if (x == 0 && y == 0) {
-        return 0;
-    }
-    yabs = y;
-    if (yabs < 0) {
-        yabs = -yabs;
-    }
-    if (x >= 0) {
-        angle = pi4 - pi4 * (x - yabs) / (x + yabs);
-    } else {
-        angle = pi34 - pi4 * (x + yabs) / (yabs - x);
-    }
-    if (y < 0) {
-        return -angle;
-    }
-    return angle;
-}
+    double zr, zj;
 
-int polar_disc_fast(int ar, int aj, int br, int bj) {
+    union vect128 {
+        __m128d vect;
+    };
 
-    int cr, cj;
-    multiply(ar, aj, br, -bj, &cr, &cj);
-    return fast_atan2(cj, cr);
-}
+    union vect128 u1 = {ar, ar};
+    union vect128 v1 = {br, bj};
+    union vect128 u0 = {aj, br};
+    union vect128 v0 = {bj, aj};
+    __m128d u1a;
 
-int atan_lut_init(void) {
+    v1.vect = _mm_mul_pd(u1.vect, v1.vect); // => {ar*br, ar*bj}
+    v0.vect = _mm_mul_pd(u0.vect, v0.vect); // => {aj*bj, br*aj}
 
-    int i = 0;
+    u1.vect = _mm_sub_pd(v1.vect,    // => {ar*br - aj*bj, ar*bj - br*aj}
+                         v0.vect);   // *we don't care about the second entry
 
-    atan_lut = malloc(atan_lut_size * sizeof(int));
+    u0.vect = _mm_add_pd(v1.vect,    // => {ar*br + aj*bj, ar*bj + br*aj}
+                         v0.vect);   // *we don't care about the first entry
 
-    for (i = 0; i < atan_lut_size; i++) {
-        atan_lut[i] = (int) (atan((double) i / (1 << atan_lut_coef)) / 3.14159 * (1 << 14));
-    }
+    zr = u1.vect[0];
+    zj = u0.vect[1];
 
-    return 0;
-}
+    u0.vect = _mm_mul_pd(u0.vect, u0.vect);
+    u1.vect = _mm_mul_pd(u1.vect, u1.vect);
+    u1a = _mm_set_pd(u1.vect[0], u1.vect[1]);
+    u0.vect = _mm_add_pd(u0.vect, u1a);
+    u0.vect = _mm_sqrt_pd(u0.vect);
 
-int polar_disc_lut(int ar, int aj, int br, int bj) {
-
-    int cr, cj, x, x_abs;
-
-    multiply(ar, aj, br, -bj, &cr, &cj);
-
-    /* special cases */
-    if (cr == 0 || cj == 0) {
-        if (cr == 0 && cj == 0) {return 0;}
-        if (cr == 0 && cj > 0) {return 1 << 13;}
-        if (cr == 0 && cj < 0) {return -(1 << 13);}
-        if (cj == 0 && cr > 0) {return 0;}
-        if (cj == 0 && cr < 0) {return 1 << 14;}
-    }
-
-    /* real range -32768 - 32768 use 64x range -> absolute maximum: 2097152 */
-    x = (cj << atan_lut_coef) / cr;
-    x_abs = abs(x);
-
-    if (x_abs >= atan_lut_size) {
-        /* we can use linear range, but it is not necessary */
-        return (cj > 0) ? 1 << 13 : -(1 << 13);
-    }
-
-    if (x > 0) {
-        return (cj > 0) ? atan_lut[x] : atan_lut[x] - (1 << 14);
-    } else {
-        return (cj > 0) ? (1 << 14) - atan_lut[-x] : -atan_lut[-x];
-    }
-
-    return 0;
-}
-
-int esbensen(int ar, int aj, int br, int bj)
-/*
-  input signal: s(t) = a*exp(-i*w*t+p)
-  a = amplitude, w = angular freq, p = phase difference
-  solve w
-  s' = -i(w)*a*exp(-i*w*t+p)
-  s'*conj(s) = -i*w*a*a
-  s'*conj(s) / |s|^2 = -i*w
-*/
-{
-
-    int cj, dr, dj;
-    int scaled_pi = 2608; /* 1<<14 / (2*pi) */
-    dr = (br - ar) * 2;
-    dj = (bj - aj) * 2;
-    cj = bj * dr - br * dj; /* imag(ds*conj(s)) */
-    return (scaled_pi * cj / (ar * ar + aj * aj + 1));
+    return (int) (zj < 0 ? -acos(zr / u0.vect[1]) : acos(zr / u0.vect[1]) * twoTo14OverPi);
 }
 
 void fm_demod(struct demod_state *fm) {
 
     int i, pcm;
     int16_t *lp = fm->lowpassed;
-    pcm = polar_discriminant(lp[0], lp[1],
-                             fm->pre_r, fm->pre_j);
+    pcm = fastArgz(lp[0], lp[1],
+                   fm->pre_r, fm->pre_j);
+
     fm->result[0] = (int16_t) pcm;
     for (i = 2; i < (fm->lp_len - 1); i += 2) {
-        switch (fm->custom_atan) {
-            case 0:
-                pcm = polar_discriminant(lp[i], lp[i + 1],
-                                         lp[i - 2], lp[i - 1]);
-                break;
-            case 1:
-                pcm = polar_disc_fast(lp[i], lp[i + 1],
-                                      lp[i - 2], lp[i - 1]);
-                break;
-            case 2:
-                pcm = polar_disc_lut(lp[i], lp[i + 1],
-                                     lp[i - 2], lp[i - 1]);
-                break;
-            case 3:
-                pcm = esbensen(lp[i], lp[i + 1],
-                               lp[i - 2], lp[i - 1]);
-                break;
-        }
-        fm->result[i / 2] = (int16_t) pcm;
+
+        pcm = fastArgz(lp[i], lp[i + 1], lp[i - 2], lp[i - 1]);
+        fm->result[i >> 1] = (int16_t) pcm;
     }
     fm->pre_r = lp[fm->lp_len - 2];
     fm->pre_j = lp[fm->lp_len - 1];
-    fm->result_len = fm->lp_len / 2;
+    fm->result_len = (fm->lp_len >> 1);
 }
 
 void am_demod(struct demod_state *fm)
@@ -1084,9 +1063,9 @@ void am_demod(struct demod_state *fm)
         */
         pcm = lp[i] * lp[i];
         pcm += lp[i + 1] * lp[i + 1];
-        r[i / 2] = (int16_t) sqrt(pcm) * fm->output_scale;
+        r[i >> 1] = (int16_t) fastSqrt(pcm) * fm->output_scale;
     }
-    fm->result_len = fm->lp_len / 2;
+    fm->result_len = (fm->lp_len >> 1);
     /* lowpass? (3khz)  highpass?  (dc) */
 }
 
@@ -1097,9 +1076,9 @@ void usb_demod(struct demod_state *fm) {
     int16_t *r = fm->result;
     for (i = 0; i < fm->lp_len; i += 2) {
         pcm = lp[i] + lp[i + 1];
-        r[i / 2] = (int16_t) pcm * fm->output_scale;
+        r[i >> 1] = (int16_t) pcm * fm->output_scale;
     }
-    fm->result_len = fm->lp_len / 2;
+    fm->result_len = (fm->lp_len >> 1);
 }
 
 void lsb_demod(struct demod_state *fm) {
@@ -1109,9 +1088,9 @@ void lsb_demod(struct demod_state *fm) {
     int16_t *r = fm->result;
     for (i = 0; i < fm->lp_len; i += 2) {
         pcm = lp[i] - lp[i + 1];
-        r[i / 2] = (int16_t) pcm * fm->output_scale;
+        r[i >> 1] = (int16_t) pcm * fm->output_scale;
     }
-    fm->result_len = fm->lp_len / 2;
+    fm->result_len = (fm->lp_len >> 1);
 }
 
 void raw_demod(struct demod_state *fm) {
@@ -1133,9 +1112,9 @@ void deemph_filter(struct demod_state *fm) {
     for (i = 0; i < fm->result_len; i++) {
         d = fm->result[i] - avg;
         if (d > 0) {
-            avg += (d + fm->deemph_a / 2) / fm->deemph_a;
+            avg += (d + (fm->deemph_a >> 1)) / fm->deemph_a;
         } else {
-            avg += (d - fm->deemph_a / 2) / fm->deemph_a;
+            avg += (d - (fm->deemph_a >> 1)) / fm->deemph_a;
         }
         fm->result[i] = (int16_t) avg;
     }
@@ -1160,6 +1139,9 @@ void dc_block_raw_filter(struct demod_state *fm, int16_t *buf, int len) {
     /* derived from dc_block_audio_filter,
         running over the raw I/Q components
     */
+    const double rRdcBlock = 1.0 / (fm->rdc_block_const + 1);
+    const double rLen = 1.0 / (len >> 1);
+
     int i, avgI, avgQ;
     int64_t sumI = 0;
     int64_t sumQ = 0;
@@ -1167,10 +1149,10 @@ void dc_block_raw_filter(struct demod_state *fm, int16_t *buf, int len) {
         sumI += buf[i];
         sumQ += buf[i + 1];
     }
-    avgI = sumI / (len / 2);
-    avgQ = sumQ / (len / 2);
-    avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) / (fm->rdc_block_const + 1);
-    avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) / (fm->rdc_block_const + 1);
+    avgI = sumI * rLen;
+    avgQ = sumQ * rLen;
+    avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) * rRdcBlock;
+    avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) * rRdcBlock;
     for (i = 0; i < len; i += 2) {
         buf[i] -= avgI;
         buf[i + 1] -= avgQ;
@@ -1179,39 +1161,27 @@ void dc_block_raw_filter(struct demod_state *fm, int16_t *buf, int len) {
     fm->dc_avgQ = avgQ;
 }
 
-int mad(int16_t *samples, int len, int step)
-/* mean average deviation */
-{
-
-    int i = 0, sum = 0, ave = 0;
-    if (len == 0) {return 0;}
-    for (i = 0; i < len; i += step) {
-        sum += samples[i];
-    }
-    ave = sum / (len * step);
-    sum = 0;
-    for (i = 0; i < len; i += step) {
-        sum += abs(samples[i] - ave);
-    }
-    return sum / (len / step);
-}
-
-int rms(int16_t *samples, int len, int step, int omitDCfix)
+int rms(const int16_t *samples, int len, int step, int omitDCfix)
 /* largely lifted from rtl_power */
 {
 
-    double dc, err;
-    int i, num;
-    int32_t t, s;
-    uint32_t p;  /* use sign bit to prevent overflow */
+    const int stepConst = step << 15; //step * 32768;
 
-    p = 0;
-    t = 0L;
-    while (len > step * 32768) { /* 8 bit squared = 16 bit. limit to 2^16 for 32 bit squared sum */
-        ++step;
+    double dc;
+    double err;
+    double tstep;
+    int i;
+    int num;
+    int32_t t = 0L;
+    uint32_t p = 0;  /* use sign bit to prevent overflow */
+
+
+    if (len > stepConst) { /* 8 bit squared = 16 bit. limit to 2^16 for 32 bit squared sum */
+        step = len / stepConst + 1;
     }  /* increase step to prevent overflow */
+
     for (i = 0; i < len; i += step) {
-        s = (long) samples[i];
+        const int32_t s = (long) samples[i];
         t += s;
         p += s * s;
     }
@@ -1219,84 +1189,15 @@ int rms(int16_t *samples, int len, int step, int omitDCfix)
     if (omitDCfix) {
         /* DC is already corrected. No need to do it again */
         num = len / step;
-        return (int) sqrt((double) (p) / num);
+        return (int) fastSqrt((double) (p) / num);
     }
 
     /* correct for dc offset in squares */
-    dc = (double) (t * step) / (double) len;
-    err = t * 2 * dc - dc * dc * len;
+    tstep = (double) (t * step);
+    dc = tstep / (double) len;
+    err = dc * ((t << 1) - tstep); // <= t * 2 * dc - dc * dc * len = t * 2 * dc - dc * (tstep / len) * len = dc * (2*t - tstep / len * len);
 
-    return (int) sqrt((p - err) / len);
-}
-
-void arbitrary_upsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
-/* linear interpolation, len1 < len2 */
-{
-
-    int i = 1;
-    int j = 0;
-    int tick = 0;
-    double frac;  /* use integers... */
-    while (j < len2) {
-        frac = (double) tick / (double) len2;
-        buf2[j] = (int16_t) (buf1[i - 1] * (1 - frac) + buf1[i] * frac);
-        j++;
-        tick += len1;
-        if (tick > len2) {
-            tick -= len2;
-            i++;
-        }
-        if (i >= len1) {
-            i = len1 - 1;
-            tick = len2;
-        }
-    }
-}
-
-void arbitrary_downsample(int16_t *buf1, int16_t *buf2, int len1, int len2)
-/* fractional boxcar lowpass, len1 > len2 */
-{
-
-    int i = 1;
-    int j = 0;
-    int tick = 0;
-    double remainder = 0;
-    double frac;  /* use integers... */
-    buf2[0] = 0;
-    while (j < len2) {
-        frac = 1.0;
-        if ((tick + len2) > len1) {
-            frac = (double) (len1 - tick) / (double) len2;
-        }
-        buf2[j] += (int16_t) ((double) buf1[i] * frac + remainder);
-        remainder = (double) buf1[i] * (1.0 - frac);
-        tick += len2;
-        i++;
-        if (tick > len1) {
-            j++;
-            buf2[j] = 0;
-            tick -= len1;
-        }
-        if (i >= len1) {
-            i = len1 - 1;
-            tick = len1;
-        }
-    }
-    for (j = 0; j < len2; j++) {
-        buf2[j] = buf2[j] * len2 / len1;
-    }
-}
-
-void arbitrary_resample(int16_t *buf1, int16_t *buf2, int len1, int len2)
-/* up to you to calculate lengths and make sure it does not go OOB
- * okay for buffers to overlap, if you are downsampling */
-{
-
-    if (len1 < len2) {
-        arbitrary_upsample(buf1, buf2, len1, len2);
-    } else {
-        arbitrary_downsample(buf1, buf2, len1, len2);
-    }
+    return (int) fastSqrt((p - err) / len);
 }
 
 static void *runPrintLevels(void *ctx) {
@@ -1307,7 +1208,7 @@ static void *runPrintLevels(void *ctx) {
     long double avgRmsLevel;
     int ret;
     char printLevelsOutput[256];
-    
+
     while (!do_exit) {
         usleep(printLevelsMs);
         pthread_mutex_lock(&s->mutex);
@@ -1319,7 +1220,7 @@ static void *runPrintLevels(void *ctx) {
 
 
             sprintf(printLevelsOutput,
-                    "%.3f kHz, %.1Lf avg rms, %llu max rms, %llu max max rms, %d squelch rms, %llu rms, %.1Lf dB rms level, %.2Lf dB avg rms level\n",
+                    "%.3f kHz, %.1Lf avg rms, %lu max rms, %lu max max rms, %d squelch rms, %lu rms, %.1Lf dB rms level, %.2Lf dB avg rms level\n",
                     (double) dongle.userFreq / 1000.0,
                     avgRms,
                     levelMax,
@@ -1358,7 +1259,9 @@ void full_demod(struct demod_state *d) {
     struct printLevelsInfo *info = d->info;
     ds_p = d->downsample_passes;
 
-    if (ds_p) {
+    if (!ds_p) {
+        low_pass(d);
+    } else {
         for (i = 0; i < ds_p; i++) {
             fifth_order(d->lowpassed, (d->lp_len >> i), d->lp_i_hist[i]);
             fifth_order(d->lowpassed + 1, (d->lp_len >> i) - 1, d->lp_q_hist[i]);
@@ -1371,20 +1274,16 @@ void full_demod(struct demod_state *d) {
             generic_fir(d->lowpassed + 1, d->lp_len - 1,
                         cic_9_tables[ds_p], d->droop_q_hist);
         }
-    } else {
-        low_pass(d);
     }
     /* power squelch */
     if (d->squelch_level) {
         sr = rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
         if (sr >= 0) {
-            if (sr < d->squelch_level) {
-                d->squelch_hits++;
-                for (i = 0; i < d->lp_len; i++) {
-                    d->lowpassed[i] = 0;
-                }
-            } else {
+            if (sr >= d->squelch_level) {
                 d->squelch_hits = 0;
+            } else {
+                d->squelch_hits++;
+                memset(d->lowpassed, 0, sizeof(int16_t) * d->lp_len);
             }
         }
     }
@@ -1443,7 +1342,10 @@ void full_demod(struct demod_state *d) {
     /* todo, fm noise squelch */
     /* use nicer filter here too? */
     if (d->post_downsample > 1) {
-        d->result_len = low_pass_simple(d->result, d->result_len, d->post_downsample);
+        d->result_len = low_pass_simple(d->result,
+                                        d->result_len,
+                                        d->post_downsample,
+                                        d->post_downsample_log2n);
     }
     if (d->deemph) {
         deemph_filter(d);
@@ -1466,6 +1368,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
     unsigned char sampleMax;
     uint32_t sampleP, samplePowSum = 0.0;
     int samplePowCount = 0, step = 2;
+    const double twoOverStepToI = 2.0 / (step << 14);
     time_t rawtime;
 
     if (do_exit) {
@@ -1508,8 +1411,11 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
         s->sampleMax = sampleMax;
     }
     if (c->checkADCrms) {
-        while ((int) len >= 16384 * step) {
-            step += 2;
+//        while ((int) len >= (step << 14)) { // step += -1 + 2*len / (step << i);
+//            step += 2;
+//        }
+        if ((int) len >= (step << 14)) {
+            step += -1 + 2 * len / (step << 14); //is the division more costly than the stupid loop?
         }
         for (i = 0; i < (int) len; i += step) {
             sampleP = ((int) buf[i] - 127) * ((int) buf[i] - 127);  /* I^2 */
@@ -1536,7 +1442,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
         rotate16_neg90(s->buf16, (int) len);
     }
     pthread_rwlock_wrlock(&d->rw);
-    memcpy(d->lowpassed, s->buf16, 2 * len);
+    memcpy(d->lowpassed, s->buf16, (len << 1));
     d->lp_len = len;
     pthread_rwlock_unlock(&d->rw);
     safe_cond_signal(&d->ready, &d->ready_m);
@@ -1581,7 +1487,7 @@ static void *demod_thread_fn(void *arg) {
 
         if (OutputToStdout) {
             pthread_rwlock_wrlock(&o->rw);
-            memcpy(o->result, d->result, 2 * d->result_len);
+            memcpy(o->result, d->result, (d->result_len << 1));
             o->result_len = d->result_len;
             pthread_rwlock_unlock(&o->rw);
             safe_cond_signal(&o->ready, &o->ready_m);
@@ -1644,7 +1550,7 @@ static void optimal_settings(uint64_t freq, uint32_t rate) {
                 capture_rate);
     }
     if (!d->offset_tuning) {
-        capture_freq = freq - capture_rate / 4;
+        capture_freq = freq - (capture_rate >> 2);
         if (verbosity >= 2) {
             fprintf(stderr,
                     "optimal_settings(freq = %f MHz): capture_freq = freq - capture_rate/4 = %f MHz\n",
@@ -1652,7 +1558,7 @@ static void optimal_settings(uint64_t freq, uint32_t rate) {
                     capture_freq * 1E-6);
         }
     }
-    capture_freq += cs->edge * dm->rate_in / 2;
+    capture_freq += cs->edge * (dm->rate_in >> 1);
     if (verbosity >= 2) {
         fprintf(stderr,
                 "optimal_settings(freq = %f MHz): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %f MHz\n",
@@ -1661,9 +1567,9 @@ static void optimal_settings(uint64_t freq, uint32_t rate) {
                 dm->rate_in,
                 capture_freq * 1E-6);
     }
-    dm->output_scale = (1 << 15) / (128 * dm->downsample);
-    if (dm->output_scale < 1) {
-        dm->output_scale = 1;
+    dm->output_scale = 256 >> (dm->downsample_passes - 1);    // (1 << 15) / (dm->downsample << 7)
+    if (dm->output_scale < 1) {                               // == 2^15/(x * 2^7) == 2^8 / x
+        dm->output_scale = 1;                                 // 2^8 >> log2(x)
     }
     if (dm->mode_demod == &fm_demod) {
         dm->output_scale = 1;
@@ -1727,7 +1633,7 @@ static void *controller_thread_fn(void *arg) {
     fprintf(stderr, "Oversampling input by: %ix.\n", demod.downsample);
     fprintf(stderr, "Oversampling output by: %ix.\n", demod.post_downsample);
     fprintf(stderr, "Buffer size: %0.2fms\n",
-            1000 * 0.5 * (float) ACTUAL_BUF_LENGTH / (float) dongle.rate);
+            1000 * (float) (ACTUAL_BUF_LENGTH >> 1) / (float) dongle.rate);
 
     /* Set the sample rate */
     if (verbosity) {
@@ -1739,9 +1645,9 @@ static void *controller_thread_fn(void *arg) {
     if (dongle.bandwidth) {
         if_band_center_freq = dongle.userFreq - dongle.freq;
         if (dongle.bccorner < 0) {
-            if_band_center_freq += (dongle.bandwidth - demod.rate_out) / 2;
+            if_band_center_freq += ((dongle.bandwidth - demod.rate_out) >> 1);
         } else if (dongle.bccorner > 0) {
-            if_band_center_freq -= (dongle.bandwidth - demod.rate_out) / 2;
+            if_band_center_freq -= ((dongle.bandwidth - demod.rate_out) >> 1);
         }
 
         if (prev_if_band_center_freq != if_band_center_freq) {
@@ -1790,7 +1696,7 @@ static void *controller_thread_fn(void *arg) {
             }
             dongle.mute = DEFAULT_BUFFER_DUMP;
         } else {
-            dongle.mute = 2 * dongle.rate; /* over a second - until parametrized the dongle */
+            dongle.mute = dongle.rate << 1; /* over a second - until parametrized the dongle */
             c->numSummed = 0;
 
             toNextCmdLine(c);
@@ -1924,7 +1830,7 @@ void demod_init(struct demod_state *s) {
     s->comp_fir_size = 0;
     s->prev_index = 0;
     s->post_downsample = 1;    // once this works, default = 4
-    s->custom_atan = 0;
+    s->post_downsample_log2n = 1;
     s->deemph = 0;
     s->rate_out2 = -1;    // flag for disabled
     s->mode_demod = &fm_demod;
@@ -2039,7 +1945,7 @@ int main(int argc, char **argv) {
 
     while ((opt = getopt(argc,
                          argv,
-                         "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:P:q:c:w:W:D:nHv")) != -1) {
+                         "d:f:g:s:b:l:o:t:r:p:R:E:O:F:A:M:hTC:B:m:L:P:q:c:w:W:X:D:nHv")) != -1) {
         switch (opt) {
             case 'd': dongle.dev_index = verbose_device_search(optarg);
                 dev_given = 1;
@@ -2075,17 +1981,33 @@ int main(int argc, char **argv) {
             case 'P':printLevelFile = fopen(optarg, "wb");
                 setvbuf(printLevelFile, NULL, _IONBF, 0);
                 break;
-            case 's': demod.rate_in = (uint32_t) atofs(optarg);
+            case 'X':
+                switch ((int) atof(optarg)) {
+                    case 0:fastSqrt = asmSqrt;
+                        break;
+                    case 1:fastSqrt = sqrtApprox;
+                        break;
+                    default:fastSqrt = sqrtf;
+                        break;
+                }
+                break;
+            case 's':demod.rate_in = (uint32_t) atofs(optarg);
                 demod.rate_out = (uint32_t) atofs(optarg);
                 break;
-            case 'r': output.rate = (int) atofs(optarg);
+            case 'r':output.rate = (int) atofs(optarg);
                 demod.rate_out2 = (int) atofs(optarg);
                 break;
             case 'o': fprintf(stderr, "Warning: -o is very buggy\n");
                 demod.post_downsample = (int) atof(optarg);
-                if (demod.post_downsample < 1 || demod.post_downsample > MAXIMUM_OVERSAMPLE) {
-                    fprintf(stderr, "Oversample must be between 1 and %i\n", MAXIMUM_OVERSAMPLE);
+                if (demod.post_downsample < 1
+                    || demod.post_downsample > MAXIMUM_OVERSAMPLE
+                    || demod.post_downsample % 2 != 0) {
+                    fprintf(stderr,
+                            "Oversample must be a power of 2 between 1 and %i\n",
+                            MAXIMUM_OVERSAMPLE);
+                    demod.post_downsample = MAXIMUM_OVERSAMPLE;
                 }
+                demod.post_downsample_log2n = (uint16_t) log2(demod.post_downsample);
                 break;
             case 't': demod.conseq_squelch = (int) atof(optarg);
                 if (demod.conseq_squelch < 0) {
@@ -2148,24 +2070,17 @@ int main(int argc, char **argv) {
                 demod.comp_fir_size = atoi(optarg);
                 break;
             case 'A':
-                if (strcmp("std", optarg) == 0) {
-                    demod.custom_atan = 0;
-                }
-                if (strcmp("fast", optarg) == 0) {
-                    demod.custom_atan = 1;
-                }
-                if (strcmp("lut", optarg) == 0) {
-                    atan_lut_init();
-                    demod.custom_atan = 2;
-                }
-                if (strcmp("ale", optarg) == 0) {
-                    demod.custom_atan = 3;
+                if (!strcmp("std", optarg)) {
+                    fastArgz = polar_discriminant;
+                } else if (!strcmp("avx", optarg)) {
+                    fastArgz = multiplyAndFindArgAvx;
                 }
                 break;
             case 'M':
                 if (strcmp("nbfm", optarg) == 0 || strcmp("nfm", optarg) == 0 || strcmp("fm",
                                                                                         optarg) == 0) {
                     demod.mode_demod = &fm_demod;
+                    fastArgz = multiplyAndFindArgAvx;
                 }
                 if (strcmp("raw", optarg) == 0 || strcmp("iq", optarg) == 0) {
                     demod.mode_demod = &raw_demod;
@@ -2186,7 +2101,6 @@ int main(int argc, char **argv) {
                     demod.rate_out = 170000;
                     demod.rate_out2 = 32000;
                     output.rate = 32000;
-                    demod.custom_atan = 1;
                     //demod.post_downsample = 4;
                     demod.deemph = 1;
                     demod.squelch_level = 0;
@@ -2253,7 +2167,7 @@ int main(int argc, char **argv) {
         output.filename = "-";
     }
 
-    ACTUAL_BUF_LENGTH = lcm_post[demod.post_downsample] * DEFAULT_BUF_LENGTH;
+    ACTUAL_BUF_LENGTH = lcm_post[demod.post_downsample] << DEFAULT_BUF_LENGTH_BITS;
 
     if (!dev_given) {
         dongle.dev_index = verbose_device_search("0");
@@ -2313,7 +2227,6 @@ int main(int argc, char **argv) {
     verbose_set_bandwidth(dongle.dev, dongle.bandwidth);
 
     if (verbosity && dongle.bandwidth) {
-        int r;
         uint32_t in_bw, out_bw, last_bw = 0;
         fprintf(stderr, "Supported bandwidth values in kHz:\n");
         for (in_bw = 1; in_bw < 3200; ++in_bw) {
@@ -2360,7 +2273,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-
+    fastArgz = polar_discriminant;
     //r = rtlsdr_set_testmode(dongle.dev, 1);
 
     /* Reset endpoint before we start reading from it (mandatory) */
@@ -2413,7 +2326,6 @@ int main(int argc, char **argv) {
 
     if (output.file != stdout) {
         if (writeWav) {
-            int r;
             waveFinalizeHeader(output.file);
             fclose(output.file);
             remove(output.filename);    /* delete, in case file already exists */
