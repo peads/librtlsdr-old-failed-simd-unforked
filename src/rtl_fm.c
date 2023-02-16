@@ -271,7 +271,7 @@ struct demod_state {
     struct printLevelsInfo *info;
     argZFun fastArgZ;
     sqrtFun fastSqrt;
-    swapFun swapper;
+    uint8_t swapper;
 };
 
 struct output_state {
@@ -492,43 +492,68 @@ static double sqrtApprox(double z) {
     return un.f;        /* Interpret again as float */
 }
 
-extern void swap2(void *x, void *y);
+//#define MUL_PLUS_J_INT( X, J )	\
+//    tmp = X[J]; \
+//    X[J] = - X[J+1]; \
+//    X[J+1] = tmp
+
+//#define MUL_MINUS_ONE_INT( X, J ) \
+//    X[J] = - X[J]; \
+//    X[J+1] = - X[J+1]
+
+//#define MUL_MINUS_J_INT( X, J ) \
+//    tmp = X[J]; \
+//    X[J] = X[J+1]; \
+//    X[J+1] = -tmp
+
+
+extern void swapNegateY(int *x, int *y);
 __asm__ (
 #ifdef __APPLE_CC__
-"_swap2: "
+"_swapNegateY: "
 #else
-"swap2: "
+"swapNegateY: "
 #endif
-    "movq (%rsi), %rax\n\t"
-    "xorq %rax, (%rdi)\n\t"
-    "xorq (%rdi), %rax\n\t"
-    "xorq %rax, (%rdi)\n\t"
-    "movq %rax, (%rsi)\n\t"
+    "movl (%rsi), %ebx\n\t"
+    "movl (%rdi), %ecx\n\t"
+    "movl %ebx, (%rdi)\n\t"
+    "negl %ecx\n\t"
+    "movl %ecx, (%rsi)\n\t"
     "ret"
 );
 
-static void swap1a(void *x, void *y) {
-
-    uintptr_t temp = *(uintptr_t *) x;
-    **((uintptr_t **) &x) = **((uintptr_t **) &y);
-    *(uintptr_t *) y = *((uintptr_t *) &temp);
-}
-
-void rotate16_neg90(struct demod_state *d, int16_t *buf, uint32_t len) {
-
+void rotate16_neg90(struct demod_state *d, int16_t *buf, uint32_t len)
+{
     /* -90 degree rotation is 1, -j, -1, +j */
     uint32_t i;
+    int16_t tmp;
+    
+    for (i=0; i<len; i+=8) {
+//        MUL_MINUS_J_INT( buf, i+2 );
+        if (d->swapper) {
+            swapNegateY((int *) &buf[i + 2], (int *) &buf[i + 3]);
+        } else {
+            tmp = buf[i + 2];
+            buf[i + 2] = buf[i + 3];
+            buf[i + 3] = -tmp;
+        }
 
-    for (i = 0; i < len; i += 8) {
-
-        d->swapper(&buf[i+2], &buf[i+3]);
-        buf[i+3] = -buf[i+3];
-
+//        MUL_MINUS_ONE_INT( buf, i+4 );
         buf[i+4] = -buf[i+4];
         buf[i+5] = -buf[i+5];
 
-        d->swapper(&buf[i+6], &buf[i+7]);
-        buf[i+6] = -buf[i+6];
+//        MUL_PLUS_J_INT( buf, i+6 );
+//        tmp = buf[i+6];
+//        buf[i+6] = -buf[i+7];
+//        buf[i+7] = tmp // which could also be seen as =>
+
+        if (d->swapper) {
+            swapNegateY((int *) &buf[i + 7], (int *) &buf[i + 6]);
+        } else {
+            tmp = buf[i + 7];
+            buf[i + 7] = buf[i + 6];
+            buf[i + 6] = -tmp;
+        }
     }
 }
 
@@ -1957,10 +1982,10 @@ int main(int argc, char **argv) {
 
     demod.fastSqrt = sqrt;
     demod.fastArgZ = polar_discriminant;
-#ifndef X86    
-    demod.swapper = swap1a;
+#ifndef X86
+    demod.swapper = 0;
 #else
-    demod.swapper = swap2;
+    demod.swapper = 1;
 #endif
 
     while ((opt = getopt(argc,
@@ -2010,12 +2035,12 @@ int main(int argc, char **argv) {
                 break;
             case 'G':
 #ifndef X86
-                demod.swapper = swap1a;
+                demod.swapper = 0;
 #else
                 if (!strcmp("asm", optarg)) {
-                    demod.swapper = swap2;
+                    demod.swapper = 1;
                 } else if (!strcmp("cla", optarg)) {
-                    demod.swapper = swap1a;
+                    demod.swapper = 0;
                 }
 #endif
                 break;
