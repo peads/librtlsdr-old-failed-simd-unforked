@@ -507,18 +507,18 @@ static double sqrtApprox(double z) {
 //    X[J+1] = -tmp
 
 
-extern void swapNegateY(int *x, int *y);
+extern void swapNegateY(int16_t *x, int16_t *y);
 __asm__ (
 #ifdef __APPLE_CC__
 "_swapNegateY: "
 #else
 "swapNegateY: "
 #endif
-    "movl (%rsi), %ebx\n\t"
-    "movl (%rdi), %ecx\n\t"
-    "movl %ebx, (%rdi)\n\t"
-    "negl %ecx\n\t"
-    "movl %ecx, (%rsi)\n\t"
+    "movl (%rsi), %bx\n\t"
+    "movl (%rdi), %cx\n\t"
+    "movl %bx, (%rdi)\n\t"
+    "negl %cx\n\t"
+    "movl %cx, (%rsi)\n\t"
     "ret"
 );
 
@@ -527,11 +527,11 @@ void rotate16_neg90(struct demod_state *d, int16_t *buf, uint32_t len)
     /* -90 degree rotation is 1, -j, -1, +j */
     uint32_t i;
     int16_t tmp;
-    
+
     for (i=0; i<len; i+=8) {
 //        MUL_MINUS_J_INT( buf, i+2 );
         if (d->swapper) {
-            swapNegateY((int *) &buf[i + 2], (int *) &buf[i + 3]);
+            swapNegateY(&buf[i + 2], &buf[i + 3]);
         } else {
             tmp = buf[i + 2];
             buf[i + 2] = buf[i + 3];
@@ -548,7 +548,7 @@ void rotate16_neg90(struct demod_state *d, int16_t *buf, uint32_t len)
 //        buf[i+7] = tmp // which could also be seen as =>
 
         if (d->swapper) {
-            swapNegateY((int *) &buf[i + 7], (int *) &buf[i + 6]);
+            swapNegateY(&buf[i + 7],  &buf[i + 6]);
         } else {
             tmp = buf[i + 7];
             buf[i + 7] = buf[i + 6];
