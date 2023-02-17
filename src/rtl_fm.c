@@ -522,6 +522,9 @@ static double sqrtApprox(double z) {
 //    "ret"
 //);
 
+static inline uint8_t uCharMax(uint8_t a, uint8_t b) {
+    return a > b ? a : b;
+}
 extern void swapNegateY(short *x, short *y);
 __asm__ (
 #ifdef __APPLE_CC__
@@ -1172,31 +1175,39 @@ void raw_demod(struct demod_state *fm) {
 
 void deemph_filter(struct demod_state *fm) {
 
-    static int avg;  /* cheating... */
-    int i, d;
+    const double oneOverDeemph = 1.0 / fm->deemph_a;
+    const double deemphBy2 = fm->deemph_a >> 1;
+
+    static double avg;  /* cheating... */
+
+    int i;
+    double d;
     /* de-emph IIR
      * avg = avg * (1 - alpha) + sample * alpha;
      */
     for (i = 0; i < fm->result_len; i++) {
         d = fm->result[i] - avg;
         if (d > 0) {
-            avg += (d + (fm->deemph_a >> 1)) / fm->deemph_a;
+            avg += (d + deemphBy2) * oneOverDeemph;
         } else {
-            avg += (d - (fm->deemph_a >> 1)) / fm->deemph_a;
+            avg += (d - deemphBy2) * oneOverDeemph;
         }
         fm->result[i] = (int16_t) avg;
     }
 }
 
 void dc_block_audio_filter(struct demod_state *fm) {
+    const double oneOverBlockConst = 1.0 / (fm->adc_block_const + 1);
 
-    int i, avg;
-    int64_t sum = 0;
+    double avg;
+    int i;
+    int sum = 0;
+
     for (i = 0; i < fm->result_len; i++) {
         sum += fm->result[i];
     }
     avg = sum / fm->result_len;
-    avg = (avg + fm->dc_avg * fm->adc_block_const) / (fm->adc_block_const + 1);
+    avg = (avg + fm->dc_avg * fm->adc_block_const) * oneOverBlockConst;
     for (i = 0; i < fm->result_len; i++) {
         fm->result[i] -= avg;
     }
@@ -1207,22 +1218,25 @@ static void dc_block_raw_filter(struct demod_state *fm, short *buf, int len) {
     /* derived from dc_block_audio_filter,
         running over the raw I/Q components
     */
+    const double oneOverBlockConst = 1.0 / (fm->rdc_block_const + 1);
 
-    int i, avgI, avgQ, sumI = 0, sumQ = 0;
+    double oneOverLen = 1.0 / (len >> 1);
+    int i;
+    double avgI, avgQ, sumI = 0, sumQ = 0;
     for (i = 0; i < len; i += 2) {
         sumI += buf[i];
         sumQ += buf[i + 1];
     }
-    avgI = sumI / (len >> 1);
-    avgQ = sumQ / (len >> 1);
-    avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) / (fm->rdc_block_const + 1);
-    avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) / (fm->rdc_block_const + 1);
+    avgI = sumI * oneOverLen;
+    avgQ = sumQ * oneOverLen;
+    avgI = (avgI + fm->dc_avgI * fm->rdc_block_const) * oneOverBlockConst;
+    avgQ = (avgQ + fm->dc_avgQ * fm->rdc_block_const) * oneOverBlockConst;
     for (i = 0; i < len; i += 2) {
         buf[i] = (short) (buf[i] - avgI);
         buf[i + 1] = (short) (buf[i+1] - avgQ);
     }
-    fm->dc_avgI = avgI;
-    fm->dc_avgQ = avgQ;
+    fm->dc_avgI = (int) avgI;
+    fm->dc_avgQ = (int) avgQ;
 }
 
 int rms(struct demod_state *d, int step)
@@ -1231,12 +1245,13 @@ int rms(struct demod_state *d, int step)
     //rms(d->lowpassed, d->lp_len, 1, d->dc_block_raw);
     const int stepConst = step << 15; //step * 32768;
 
+    double oneOverStep = 1.0 / step;
     double dc;
     double err;
     double tstep;
-    int i;
+    int i, s;
     int num;
-    int32_t t = 0L;
+    int t = 0L;
     uint32_t p = 0;  /* use sign bit to prevent overflow */
 
 
@@ -1245,14 +1260,15 @@ int rms(struct demod_state *d, int step)
     }  /* increase step to prevent overflow */
 
     for (i = 0; i < d->lp_len; i += step) {
-        const int32_t s = d->lowpassed[i];
+        s = d->lowpassed[i];
         t += s;
         p += s * s;
     }
 
     if (d->dc_block_raw) {
         /* DC is already corrected. No need to do it again */
-        num = d->lp_len / step;
+
+        num = d->lp_len * oneOverStep;
         return (int) d->fastSqrt((double) (p) / num);
     }
 
@@ -1430,12 +1446,33 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
     struct dongle_state *s = ctx;
     struct demod_state *d = s->demod_target;
     struct cmd_state *c = d->cmd;
-    int i, muteLen = s->mute;
-    unsigned char sampleMax;
-    uint32_t sampleP, samplePowSum = 0.0;
+    int i, j, k=0, muteLen = s->mute;
+    __m128i sampleMax;
+    __m128i sampleP = _mm_setzero_si128();
+    __m128i samplePowSum = _mm_setzero_si128();
     int samplePowCount = 0, step = 2;
     const double twoOverStepToI = 2.0 / (step << 14);
     time_t rawtime;
+
+    int lenOver16 = len >> 4;
+    __m128i arr[len];
+    unsigned char *firstHalf __attribute__((aligned(16)));
+    unsigned char *secondHalf __attribute__((aligned(16)));
+    uint8_t temp[16] __attribute__((aligned(16)));;
+    __m128i lower;
+    __m128i higher;
+    const __m128i zero = _mm_setzero_si128();
+    __m128i Z = _mm_set1_epi16(127);
+
+    //fprintf(stderr, "Creating the vectors\n");
+    for (i = 0; i < len; i+=16) {
+        firstHalf = buf + i;
+        secondHalf = buf + i + 8;
+
+        arr[k++] = _mm_unpacklo_epi64(
+                _mm_loadl_epi64((const __m128i*) firstHalf),
+                _mm_loadl_epi64((const __m128i*) secondHalf));
+    }
 
     if (do_exit) {
         return;
@@ -1468,34 +1505,65 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
      * - before conversion to 16 bit and before DC filtering.
      * we only get bitmask of positive samples (after -127) but that won't matter */
     if (c->checkADCmax) {
-        sampleMax = s->sampleMax;
-        for (i = 0; i < (int) len; i++) {
-            if (buf[i] > sampleMax) {
-                sampleMax = buf[i];
-            }
+        //fprintf(stderr, "Checking ADC max\n");
+
+        sampleMax = _mm_max_epi8(arr[0], arr[1]);
+        for (i = 2; i < lenOver16; ++i) {
+            sampleMax = _mm_max_epi8(sampleMax, arr[i]);
         }
-        s->sampleMax = sampleMax;
-    }
-    if (c->checkADCrms) {
-//        while ((int) len >= (step << 14)) { // step += -1 + 2*len / (step << i);
-//            step += 2;
+        s->sampleMax = uCharMax(s->sampleMax,
+                                uCharMax(sampleMax[0], sampleMax[1]));
+//        for (i = 0; i < (int) len; i++) {
+//            if (buf[i] > sampleMax) {
+//                sampleMax = buf[i];
+//            }
 //        }
-        if ((int) len >= (step << 14)) {
-            step += -1 + 2 * len / (step << 14); //is the division more costly than the stupid loop?
-        }
-        for (i = 0; i < (int) len; i += step) {
-            sampleP = ((int) buf[i] - 127) * ((int) buf[i] - 127);  /* I^2 */
-            sampleP += ((int) buf[i + 1] - 127) * ((int) buf[i + 1] - 127);  /* Q^2 */
-            samplePowSum += sampleP;
+    }
+
+    /* 1st: convert to 16 bit - to allow easier calculation of DC */
+//    for (i = 0; i < (int) len; i++) {
+//        s->buf16[i] = ((int16_t) buf[i] - 127);
+//    }
+    //fprintf(stderr, "Casting uint8 input buffer to int16 sample buffer\n");
+    for (i = 0; i < lenOver16; ++i) {
+
+        lower = _mm_unpacklo_epi8(  arr[i], zero );
+        higher = _mm_unpackhi_epi8(  arr[i], zero );
+
+        if (c->checkADCrms) {
+            //fprintf(stderr, "Calculating power sum average\n");
+            sampleP = _mm_add_epi16(_mm_mullo_epi16(lower, higher), sampleP);
+            samplePowSum = _mm_avg_epu16(_mm_add_epi16(samplePowSum, sampleP), sampleP);
             ++samplePowCount;
         }
-        s->samplePowSum += (double) samplePowSum / samplePowCount;
+
+        _mm_storeu_si128((__m128i_u *) (s->buf16 + i + 8),_mm_sub_epi16(higher, Z));
+        _mm_storeu_si128((__m128i_u *) (s->buf16 + i), _mm_sub_epi16(lower, Z));
+    } 
+
+    if (c->checkADCrms) {
+        //fprintf(stderr, "Storing power sum avg\n");
+        s->samplePowSum = samplePowSum[0];
+//        if ((int) len >= (step << 14)) {
+//            step += -1 + 2 * len / (step << 14); //is the division more costly than the stupid loop?
+//        }
+//        for (i = 0; i < (int) len; i += step) {
+//            sampleP = ((int) buf[i] - 127) * ((int) buf[i] - 127);  /* I^2 */
+//            sampleP += ((int) buf[i + 1] - 127) * ((int) buf[i + 1] - 127);  /* Q^2 */
+//            samplePowSum += sampleP;
+//            ++samplePowCount;
+//        }
+//        s->samplePowSum += (double) samplePowSum / samplePowCount;
         s->samplePowCount += 1;
     }
-    /* 1st: convert to 16 bit - to allow easier calculation of DC */
-    for (i = 0; i < (int) len; i++) {
-        s->buf16[i] = ((int16_t) buf[i] - 127);
-    }
+    //fprintf(stderr, "Done with vector work!\n");
+    
+
+    //for (i = 0; i < len; ++i) {
+    //    fprintf(stderr, "%d ", s->buf16[i]);
+    //}
+    //fprintf(stderr, "\n");
+    
     /* 2nd: do DC filtering BEFORE up-mixing */
     if (d->dc_block_raw) {
         dc_block_raw_filter(d, s->buf16, (int) len);
