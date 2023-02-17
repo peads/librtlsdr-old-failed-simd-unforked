@@ -1525,7 +1525,8 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
 //        s->buf16[i] = ((int16_t) buf[i] - 127);
 //    }
     //fprintf(stderr, "Casting uint8 input buffer to int16 sample buffer\n");
-    for (i = 0; i < lenOver16; ++i) {
+
+    for (k = 0, i = 0; i < lenOver16; ++i) {
 
         lower = _mm_unpacklo_epi8(  arr[i], zero );
         higher = _mm_unpackhi_epi8(  arr[i], zero );
@@ -1537,8 +1538,9 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
             ++samplePowCount;
         }
 
-        _mm_storeu_si128((__m128i_u *) (s->buf16 + i + 8),_mm_sub_epi16(higher, Z));
-        _mm_storeu_si128((__m128i_u *) (s->buf16 + i), _mm_sub_epi16(lower, Z));
+        _mm_storeu_si128((__m128i_u *) (s->buf16 + k), _mm_sub_epi16(lower, Z));
+        _mm_storeu_si128((__m128i_u *) (s->buf16 + k + 8),_mm_sub_epi16(higher, Z));
+        k+=16;
     } 
 
     if (c->checkADCrms) {
