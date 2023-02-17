@@ -165,7 +165,7 @@ static int32_t prev_if_band_center_freq = 0;
 
 typedef double (*argZFun)(int ar, int aj, int br, int bj);
 typedef double (*sqrtFun)(double x);
-typedef void (*swapFun)(void * x, void* y);
+typedef void (*rotateFun)(short * buf, int len);
 
 enum trigExpr {crit_IN = 0, crit_OUT, crit_LT, crit_GT};
 char *aCritStr[] = {"in", "out", "<", ">"};
@@ -271,7 +271,7 @@ struct demod_state {
     struct printLevelsInfo *info;
     argZFun fastArgZ;
     sqrtFun fastSqrt;
-    uint8_t swapper;
+    rotateFun swapper;
 };
 
 struct output_state {
@@ -537,38 +537,52 @@ __asm__ (
     "ret"
 );
 
-void rotate16_neg90(struct demod_state *d, int16_t *buf, uint32_t len)
+void rotate16_neg90(short *buf, int len)
 {
     /* -90 degree rotation is 1, -j, -1, +j */
     uint32_t i;
     int16_t tmp;
-    
+
     for (i=0; i<len; i+=8) {
 
-        if (d->swapper) {
-            swapNegateY(&buf[i + 2], &buf[i + 3]);
-        } else {
-            MUL_MINUS_J_INT( buf, i+2 );
-            //tmp = buf[i + 2];
-            //buf[i + 2] = buf[i + 3];
-            //buf[i + 3] = -tmp;
-        }
+        MUL_MINUS_J_INT( buf, i+2 );
 
         MUL_MINUS_ONE_INT( buf, i+4 );
-//        buf[i+4] = -buf[i+4];
-//        buf[i+5] = -buf[i+5];
 
-        if (d->swapper) {
-            swapNegateY(&buf[i + 7], &buf[i + 6]);
-        } else {
-            MUL_PLUS_J_INT( buf, i+6 );
-            //tmp = buf[i+6];
-            //buf[i+6] = -buf[i+7];
-            //buf[i+7] = tmp // which could also be seen as =>
-            //tmp = buf[i + 7];
-            //buf[i + 7] = buf[i + 6];
-            //buf[i + 6] = -tmp;
-        }
+        MUL_PLUS_J_INT( buf, i+6 );
+    }
+}
+
+union combine {
+    short arr[sizeof(__m128i) / sizeof(uint16_t)] __attribute__((aligned(16)));
+    __m128i vect;
+};
+
+static const union combine X = {.arr = {1,1,1,1,-1,-1,1,-1}};
+static const union combine Y = {.arr = {1,1,-1,1,1,1,1,1}};
+
+void rotate16_neg90_vect(short *buf, int len) {
+
+    short *firstHalf __attribute__((aligned(16)));
+    short *secondHalf __attribute__((aligned(16)));
+
+    int i, j, k = 0;
+    int max = len >> 2;
+    __m128i arr[max >> 1];
+
+    for (i = 0; i < max; i += 2) {
+        j = (i << 2);
+        firstHalf = buf + j;
+        secondHalf = buf + j + 4;
+
+        arr[k++] = _mm_unpacklo_epi64(
+                _mm_loadl_epi64((const __m128i*) firstHalf),
+                _mm_loadl_epi64((const __m128i*) secondHalf));
+    }
+
+    for (i = 0; i < (max >> 2); ++i) {
+        arr[i] = _mm_mullo_epi16(arr[i], X.vect);
+        arr[i] = _mm_mullo_epi16(arr[i], Y.vect);
     }
 }
 
@@ -1491,7 +1505,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
     }    /* "mute" after the dc_block_raw_filter(), giving it time to remove the new DC */
     /* 3rd: down-mixing */
     if (!s->offset_tuning) {
-        rotate16_neg90(d, s->buf16, (int) len);
+        d->swapper(s->buf16, (int) len);
     }
     pthread_rwlock_wrlock(&d->rw);
     memcpy(d->lowpassed, s->buf16, (len << 1));
@@ -1997,11 +2011,7 @@ int main(int argc, char **argv) {
 
     demod.fastSqrt = sqrt;
     demod.fastArgZ = polar_discriminant;
-#ifndef X86
-    demod.swapper = 0;
-#else
-    demod.swapper = 1;
-#endif
+    demod.swapper = rotate16_neg90;
 
     while ((opt = getopt(argc,
                          argv,
@@ -2050,12 +2060,12 @@ int main(int argc, char **argv) {
                 break;
             case 'G':
 #ifndef X86
-                demod.swapper = 0;
+                demod.swapper = rotate16_neg90;
 #else
-                if (!strcmp("asm", optarg)) {
-                    demod.swapper = 1;
-                } else if (!strcmp("cla", optarg)) {
-                    demod.swapper = 0;
+                if (!strcmp("avx", optarg)) {
+                    demod.swapper = rotate16_neg90_vect;
+                } else if (!strcmp("std", optarg)) {
+                    demod.swapper = rotate16_neg90;
                 }
 #endif
                 break;
